@@ -1,8 +1,13 @@
-# claude-config
+<p align="center"><img src="assets/logo.svg" width="112" alt=""></p>
+<h1 align="center">claude-config</h1>
 
 A cost-first Claude Code setup: one Opus session plans and reviews, and hands the work to cheaper workers
 (Haiku to read, Sonnet to build, Opus only where mistakes are expensive), each at an explicit effort level.
 Install it once per device; every device then pulls the same rules, agents, skills and settings.
+
+A real session, sped up between the routing lines (sound on):
+
+https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 
 | Path | What |
 |---|---|
