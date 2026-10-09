@@ -1,0 +1,47 @@
+{
+  "permissions": { "defaultMode": "auto" },
+  "worktree": { "baseRef": "fresh" },
+  "outputStyle": "Concise",
+  "theme": "auto",
+  "tui": "fullscreen",
+  "autoUpdatesChannel": "latest",
+  "autoMemoryEnabled": false,
+  "crossSessionInbound": "accept",
+  "useAutoModeDuringPlan": true,
+  "workflowKeywordTriggerEnabled": false,
+  "autoContinueAtUsageLimit": false,
+  "switchModelsOnFlag": true,
+  "promptSuggestionEnabled": false,
+  "awaySummaryEnabled": false,
+  "feedbackDrafts": "off",
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true,
+  "modelSettings": {
+    "claude-opus-5-5": { "effortLevel": "high", "autoCompactWindow": 300000 },
+    "claude-fable-5-1": { "effortLevel": "high", "autoCompactWindow": 300000 },
+    "claude-sonnet-5-5": { "effortLevel": "high", "autoCompactWindow": 300000 },
+    "claude-haiku-5-5": { "effortLevel": "medium", "autoCompactWindow": 100000 }
+  },
+  "enabledPlugins": {
+    "skill-creator@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "browser-use@claude-plugins-official": true,
+    "ponytail@ponytail": true,
+    "babysit-pr@berkay": true,
+    "limit-resume@berkays-mods": true,
+    "workers@berkays-mods": true,
+    "identity-keeper@berkays-mods": true,
+    "proof-gate@berkays-mods": true,
+    "effort-gate@berkays-mods": true,
+    "route-ledger@berkays-mods": true,
+    "config-sync@berkays-mods": true
+  },
+  "extraKnownMarketplaces": {
+    "claude-plugins-official": { "source": { "source": "github", "repo": "anthropics/claude-plugins-official" } },
+    "ponytail": { "source": { "source": "github", "repo": "DietrichGebert/ponytail" } },
+    "berkay": { "source": { "source": "github", "repo": "Berkay2002/babysit-pr" } },
+    "berkays-mods": { "source": { "source": "github", "repo": "Berkay2002/berkays-mods" } }
+  }
+}
