@@ -36,7 +36,9 @@
     "proof-gate@berkays-mods": true,
     "effort-gate@berkays-mods": true,
     "route-ledger@berkays-mods": true,
-    "config-sync@berkays-mods": true
+    "config-sync@berkays-mods": true,
+    "savvy-progress@berkays-mods": true,
+    "cache-tax@berkays-mods": true
   },
   "extraKnownMarketplaces": {
     "claude-plugins-official": { "source": { "source": "github", "repo": "anthropics/claude-plugins-official" } },

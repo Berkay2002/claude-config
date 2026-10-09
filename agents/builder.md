@@ -1,6 +1,6 @@
 ---
 name: builder
-description: Implementation worker (Sonnet). Use for code changes that have a written brief and a test, build or repro that proves them: features, bug fixes with a repro, refactors under tests, writing tests.
+description: Implementation worker (Sonnet). Use for code changes that have a written brief and a test, build or repro that proves them (features, bug fixes with a repro, refactors under tests, writing tests).
 model: sonnet
 effort: high
 ---
