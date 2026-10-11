@@ -16,6 +16,7 @@ Usage window (long unattended runs): the numbers live in `~/.claude/usage-window
 `pausePercent` (5-hour usage at which to pause), `resumeDelayMinutes` (wait after the reset), `until` (ISO end time),
 `peers` (other orchestrators to tell). No file means no window: work normally. The `limit-resume` mod reads it, puts
 the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-resumes at the reset plus the delay.
+- At `warnPercent` (optional): message each peer "NEAR LIMIT: 5h at N%" so they can wrap up, once per window.
 - At `pausePercent`: stop every worker you launched (TaskStop subagents, end your `claude --bg` sessions), message each
   peer to pause and stop its own workers and sessions (VDI/VPS ones included), then stay idle. Don't start new work.
 - On resume (reset + delay): restart or re-brief the stopped workers from their briefs and tell the peers to resume.
