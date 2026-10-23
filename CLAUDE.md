@@ -21,7 +21,7 @@ else, no boost). Before each routing call, read the weekly `percentUsed` and `re
 | Max 20x | reset ≤ 3 days away and spare ≥ 21%/day | reset ≤ 2 days away and spare ≥ 35%/day |
 | Max 5x | reset ≤ 2 days away and spare ≥ 28%/day | never |
 Example: 20x, 28% used, 2.6 days left → 27.7%/day → +1. A rung is the next step on that ladder: builder sonnet@high →
-opus@medium (+2: opus@high), sonnet@medium edits → sonnet@high, reviewer @medium → @high, scouts one effort step up.
+opus@medium (+2: opus@high), sonnet@medium edits → sonnet@high, reviewer @medium → @high, scouts one effort step up (never past xhigh).
 What stays: Opus@xhigh/max still needs my OK, Fable still only on request, Haiku still only reads or does mechanical
 edits, quick lookups I am waiting on stay at low/medium, and pure mechanical work (rename, grep, running tests) keeps
 its rung. Escalation (rule 2) starts from the boosted rung. Put it in the routing line, e.g. "→ builder opus@medium
@@ -41,9 +41,9 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   grep, summarise and report on material it is given (logs, diffs, docs, web pages, test output). Never let it answer
   from memory (API details, "how does X work") or run multi-step tool/shell loops (that is Sonnet's job even when it
   looks small: Terminal-Bench 29 for Haiku@xhigh vs 44 for Sonnet@high). Reading ladder: `haiku@low → medium → high →
-  xhigh → max`. **Scouting is always Haiku**: when Haiku@max still misses, the slice is too big (split it) or the
-  question needs judgement (give the scouts' findings to a `reviewer`), never an Opus or Sonnet scout. Haiku@max
-  matches Opus@low at 40% of the cost, so Opus@low is never the pick.
+  xhigh`, and xhigh is the top: **never Haiku@max**, for reading or code. **Scouting is always Haiku**: when Haiku@xhigh
+  still misses, the slice is too big (split it) or the question needs judgement (give the scouts' findings to a
+  `reviewer`), never an Opus or Sonnet scout. Opus@low is never the pick.
   Haiku@xhigh is slow (~57s to first token): use low/medium when I am waiting on a quick lookup.
   Haiku is 5× cheaper below 100K context ($0.10/$0.50 vs $0.50/$2.50 per MTok above), so it auto-compacts at 100K
   (Opus/Sonnet at 300K). Size the read before launching (file sizes, about 4 characters a token): up to ~60K tokens,
@@ -51,7 +51,7 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   which splits the read into ~60K slices, runs a Haiku scout per slice in parallel and returns one merged report, so
   neither it nor this session reads the material.
   For code edits Haiku is only for mechanical, exactly specified ones (rename, reformat, fill a template), at most
-  xhigh: **never Haiku@max for code** (lower coding score than xhigh at 4× the cost).
+  xhigh (Haiku@max codes worse than xhigh at 4× the cost).
 - **Coding**: `sonnet@high` is the default builder (cheapest real coder, fastest responses). Escalate to `opus@medium`:
   ~1.5× the cost, Terminal-Bench 53 vs 44, finishes faster, and far fewer hallucinated API facts. Then `opus@high`.
   `sonnet@medium` is the cheap rung below it (about half the cost, clearly lower score): small, fully specified edits
@@ -66,7 +66,7 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   debugging after one failed fix, security, concurrency, data-loss or money paths, final review before merge, writing
   briefs. Opus@medium is the best value of the five (best long-context reading, fastest, fewest tokens).
 - **Opus@xhigh/max for subagents or background sessions only with my explicit OK** (the `effort-gate` mod asks me).
-  Sonnet and Haiku may use any effort. **Fable 5.1** only if I ask, or Opus failed twice on the same problem; ask first.
+  Sonnet may use any effort; Haiku up to xhigh. **Fable 5.1** only if I ask, or Opus failed twice on the same problem; ask first.
 
 Rules:
 1. The orchestrator plans, decides, writes briefs, reviews and talks to me. It does not do bulk reading or bulk typing.
