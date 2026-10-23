@@ -41,10 +41,15 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   grep, summarise and report on material it is given (logs, diffs, docs, web pages, test output). Never let it answer
   from memory (API details, "how does X work") or run multi-step tool/shell loops (that is Sonnet's job even when it
   looks small: Terminal-Bench 29 for Haiku@xhigh vs 44 for Sonnet@high). Reading ladder: `haiku@low → medium → high →
-  xhigh → max`, then `opus@medium`. Haiku@max matches Opus@low at 40% of the cost, so Opus@low is never the pick.
+  xhigh → max`. **Scouting is always Haiku**: when Haiku@max still misses, the slice is too big (split it) or the
+  question needs judgement (give the scouts' findings to a `reviewer`), never an Opus or Sonnet scout. Haiku@max
+  matches Opus@low at 40% of the cost, so Opus@low is never the pick.
   Haiku@xhigh is slow (~57s to first token): use low/medium when I am waiting on a quick lookup.
   Haiku is 5× cheaper below 100K context ($0.10/$0.50 vs $0.50/$2.50 per MTok above), so it auto-compacts at 100K
-  (Opus/Sonnet at 300K): give each scout a slice that fits well under 100K and fan out several scouts for bigger reads.
+  (Opus/Sonnet at 300K). Size the read before launching (file sizes, about 4 characters a token): up to ~60K tokens,
+  one scout; two or three slices, fan the scouts out yourself; more than that, launch one `scout-lead` (sonnet@medium),
+  which splits the read into ~60K slices, runs a Haiku scout per slice in parallel and returns one merged report, so
+  neither it nor this session reads the material.
   For code edits Haiku is only for mechanical, exactly specified ones (rename, reformat, fill a template), at most
   xhigh: **never Haiku@max for code** (lower coding score than xhigh at 4× the cost).
 - **Coding**: `sonnet@high` is the default builder (cheapest real coder, fastest responses). Escalate to `opus@medium`:
@@ -69,7 +74,7 @@ Rules:
    step up with the failure output in the new brief. When failure would be subtle or silent, start at Opus.
 3. Judge cost per finished task, not per call: a cheap run that needs three retries is not cheap.
 4. Keep context lean: give workers paths and the brief, not pasted files; ask them for conclusions, not dumps.
-5. Agents: `scout` (haiku, default medium), `builder` (sonnet, default high), `reviewer` (opus, default medium; high for security and final review). Override
+5. Agents: `scout` (haiku, default medium), `scout-lead` (sonnet, medium; splits big reads across scouts), `builder` (sonnet, default high), `reviewer` (opus, default medium; high for security and final review). Override
    effort per the ladders. A `claude --bg` without `--model` inherits Opus, so always pass `--model` (`effort-gate` denies it otherwise).
 6. Don't switch model mid-session in a long session: it invalidates the prompt cache. Pick per worker at launch.
    Effort is free to change on the 5.5 models and Fable (subscription or API key): `/effort` up for one hard step, then back.
