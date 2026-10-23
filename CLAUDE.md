@@ -12,6 +12,21 @@ tell me in one line so I can update this file.
 
 Budget: when my weekly usage (`/usage`) is above 75%, drop one rung on every ladder; above 90%, ask me before any Opus worker.
 
+Boost (Max 5x and 20x only): weekly quota the reset is about to wipe is worth spending. The plan is
+`oauthAccount.organizationRateLimitTier` in `~/.claude.json` (`default_claude_max_20x` / `default_claude_max_5x`; anything
+else, no boost). Before each routing call, read the weekly `percentUsed` and `resetsAt` from `~/.claude/usage/limits.json`
+(or `/usage`) and work out spare = (100 − used%) ÷ days to reset. An even pace is 14% a day. Boost needs used ≤ 60%.
+| Plan | +1 rung | +2 rungs |
+|---|---|---|
+| Max 20x | reset ≤ 3 days away and spare ≥ 21%/day | reset ≤ 2 days away and spare ≥ 35%/day |
+| Max 5x | reset ≤ 2 days away and spare ≥ 28%/day | never |
+Example: 20x, 28% used, 2.6 days left → 27.7%/day → +1. A rung is the next step on that ladder: builder sonnet@high →
+opus@medium (+2: opus@high), sonnet@medium edits → sonnet@high, reviewer @medium → @high, scouts one effort step up.
+What stays: Opus@xhigh/max still needs my OK, Fable still only on request, Haiku still only reads or does mechanical
+edits, quick lookups I am waiting on stay at low/medium, and pure mechanical work (rename, grep, running tests) keeps
+its rung. Escalation (rule 2) starts from the boosted rung. Put it in the routing line, e.g. "→ builder opus@medium
+(boost +1: 28% used, 2.6 d to reset): …". Recompute at each launch; a running worker keeps its pick.
+
 Usage window (long unattended runs): the numbers live in `~/.claude/usage-window.json` on each machine, never here:
 `pausePercent` (5-hour usage at which to pause), `resumeDelayMinutes` (wait after the reset), `until` (ISO end time),
 `peers` (other orchestrators to tell). No file means no window: work normally. The `limit-resume` mod reads it, puts
