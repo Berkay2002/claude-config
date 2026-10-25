@@ -22,7 +22,7 @@ else, no boost). Before each routing call, read the weekly `percentUsed` and `re
 | Max 5x | reset ≤ 2 days away and spare ≥ 28%/day | never |
 Example: 20x, 28% used, 2.6 days left → 27.7%/day → +1. A rung is the next step on that ladder: builder sonnet@high →
 opus@medium (+2: opus@high), sonnet@medium edits → sonnet@high, reviewer @medium → @high, scouts one effort step up (never past xhigh).
-What stays: Opus@xhigh/max still needs my OK, Fable still only on request, Haiku still only reads or does mechanical
+What stays: Opus@xhigh/max still needs my OK, Fable still only on request or for security audits, Haiku still only reads or does mechanical
 edits, quick lookups I am waiting on stay at low/medium, and pure mechanical work (rename, grep, running tests) keeps
 its rung. Escalation (rule 2) starts from the boosted rung. Put it in the routing line, e.g. "→ builder opus@medium
 (boost +1: 28% used, 2.6 d to reset): …". Recompute at each launch; a running worker keeps its pick.
@@ -67,6 +67,10 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   briefs. Opus@medium is the best value of the five (best long-context reading, fastest, fewest tokens).
 - **Opus@xhigh/max for subagents or background sessions only with my explicit OK** (the `effort-gate` mod asks me).
   Sonnet may use any effort; Haiku up to xhigh. **Fable 5.1** only if I ask, or Opus failed twice on the same problem; ask first.
+- **Security audits go to Fable 5.1@high** when weekly usage is 60% or less (above that, `reviewer` opus@high): an
+  adversarial review of a security design, threat model, sandbox, credential or auth path, done as its own task. No need
+  to ask; put it in the routing line. Security points inside ordinary review or debugging stay with Opus. In the desktop
+  app, `start_session` drops a Fable pick and starts on Opus: start it, then `set_session_model` to Fable before it works.
 
 Rules:
 1. The orchestrator plans, decides, writes briefs, reviews and talks to me. It does not do bulk reading or bulk typing.
