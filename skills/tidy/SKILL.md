@@ -47,4 +47,4 @@ didn't pick; `--auto` never touches them.
 ## Notes
 - Config: `~/.claude/tidy.json` `{"roots": [...], "keep": [...], "min_age_hours": 24}`; created with defaults on first run.
 - Log of every `--apply`/`--auto` run: `~/.claude/tidy.log`.
-- Tests: `cd ~/.claude/skills/tidy && /usr/bin/python3.11 -m unittest -v test_tidy`.
+- Tests: `cd ~/.claude/skills/tidy && /usr/bin/python3.11 -B -m unittest -v test_tidy`.

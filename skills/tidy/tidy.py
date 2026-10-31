@@ -470,7 +470,16 @@ def apply(conf, quiet=False):
         lines += [f"ABORT: {e}" for e in errors] + ["ABORT: removed nothing"]
         return finish(lines, quiet, 1)
     lines += [f"warning: {e}" for e in errors]
-    exe = claude_exe() or "claude"  # sess is not None, so it was found
+    try:
+        act(conf, wts, srows, lines)
+    except Exception as e:  # whatever was already removed still gets its log block
+        lines.append(f"ABORT: {type(e).__name__}: {e}")
+        return finish(lines, quiet, 1)
+    return finish(lines, quiet, 0)
+
+
+def act(conf, wts, srows, lines):
+    exe = claude_exe() or "claude"  # the scan listed sessions, so it was found
     for s in srows:
         if s["action"] != "rm":
             continue
@@ -497,7 +506,6 @@ def apply(conf, quiet=False):
             lines.append(f"removed {w['path']} ({human(w['size'] or 0)})")
         except GitError as e:
             lines.append(f"failed {w['path']}: {e}")
-    return finish(lines, quiet, 0)
 
 
 def finish(lines, quiet, code):

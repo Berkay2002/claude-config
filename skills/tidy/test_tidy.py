@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-"""Classification and removal rules of tidy.py, on throwaway repos. Run: /usr/bin/python3.11 -m unittest -v test_tidy
+"""Classification and removal rules of tidy.py, on throwaway repos. Run: /usr/bin/python3.11 -B -m unittest -v test_tidy
 
 Every test runs with HOME, git config and the claude CLI pointed into a temp dir (a fake `claude`), so nothing
 here can reach the real machine's repos, sessions or `claude rm`.
@@ -466,6 +466,26 @@ class ReviewFindings(Base):
             tidy.sessions = real_sessions
         self.assertIn("changed since the scan", out)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "rm.log")))
+
+
+    def test_crash_mid_apply_still_logs(self):
+        self.wt("w")
+        saved = tidy.list_worktrees
+
+        def boom(common, d):  # works for the scan, fails in the recheck
+            if boom.n:
+                raise tidy.GitError("boom")
+            boom.n += 1
+            return saved(common, d)
+        boom.n = 0
+        tidy.list_worktrees = boom
+        try:
+            code, _ = self.run_main("--auto")
+        finally:
+            tidy.list_worktrees = saved
+        self.assertEqual(code, 1)
+        with open(os.path.join(os.environ["HOME"], ".claude", "tidy.log")) as f:
+            self.assertIn("ABORT: GitError: boom", f.read())
 
 
 class Offline(Base):
