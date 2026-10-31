@@ -6,7 +6,8 @@ description: Clean up git worktrees, finished background sessions and offline Re
 # Tidy worktrees and sessions
 
 One script does the checking: `/usr/bin/python3.11 ~/.claude/skills/tidy/tidy.py` (stdlib only; the system
-`python3` is too old). It never deletes a local branch, never touches a repo's main working tree, and treats any
+`python3` is too old). It never deletes a local branch itself (`claude rm` may drop a session's own worktree branch,
+so it only runs when that branch has nothing unpushed), never touches a repo's main working tree, and treats any
 doubt as Keep or Ask. A daily cron runs `--auto`, which only does the Safe part; this skill is for the rest.
 
 ## 1. Report
@@ -14,7 +15,8 @@ doubt as Keep or Ask. A daily cron runs `--auto`, which only does the Safe part;
 `~/.claude/tidy.json` and every background session gets a class and a reason:
 - **keep**: locked, on the keep list, a process or live session inside it, touched within `min_age_hours`, or a git
   error. Never removed. Mention a Keep only when it looks stale (e.g. locked by a dead pid) and ask before unlocking.
-- **ask**: tracked changes, untracked files, unpushed commits, nested git repos, or the directory is missing.
+- **ask**: tracked changes, untracked files, unpushed commits (also ones only in the worktree's HEAD reflog), nested
+  git repos, or the directory is missing.
 - **safe**: clean, its HEAD on a remote or the default branch, old enough, not in use.
 - Sessions: `rm` (finished, worktree safe or gone, branch has nothing unpushed), `ask`, `keep` (finished
   recently), `live` (report only).
@@ -28,7 +30,8 @@ sessions. It aborts and removes nothing if `claude agents` or `/proc` can't be r
 ## 3. Walk through Ask
 One `AskUserQuestion` per batch of up to four Ask worktrees, each with: **Back up and remove** / **Keep**. Put the
 reason (e.g. "2 untracked files, 1 unpushed commit on detached HEAD") in the question.
-- Back up and remove: `tidy.py --backup <path>`. It tags detached unpushed commits as `backup/wt-<name>`, saves
+- Back up and remove: `tidy.py --backup <path>`. It tags detached unpushed commits as `backup/wt-<name>` (reflog-only
+  ones as `backup/wt-<name>-reflog-<sha>`), saves
   tracked and untracked changes to `~/worktree-backups/<repo>-<name>.patch`, then removes the worktree. Commits on a
   branch stay on the branch. It refuses Keep items and worktrees with nested repos; report those to the user.
 - `ask` sessions: name the reason. If the user wants one gone, `claude rm <id>` (it refuses unpushed or dirty

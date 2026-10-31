@@ -281,6 +281,9 @@ class Apply(Base):
     def setup_mix(self):
         self.safe = self.wt("safe")
         os.makedirs(os.path.join(self.safe, "node_modules"))
+        self.exclude(self.safe, "node_modules/")  # ignored files must not block a plain `git worktree remove`
+        with open(os.path.join(self.safe, "node_modules", "pkg.js"), "w") as f:
+            f.write("ignored")
         self.dirty = self.wt("dirty")
         with open(os.path.join(self.dirty, "new"), "w") as f:
             f.write("work")
@@ -390,14 +393,96 @@ class Backup(Base):
         self.assertNotIn(p, self.registered())
 
 
+class ReviewFindings(Base):
+    def test_commit_only_in_head_reflog_is_ask_and_backup_tags_it(self):
+        p = self.wt("det")
+        x = self.commit(p, "work")  # detached commit, never pushed, then moved away from
+        self.sh("git", "-C", p, "checkout", "-q", "--detach", "origin/main")
+        self.age(p)
+        c, why = self.cls(p)
+        self.assertEqual(c, "ask")
+        self.assertIn("reflog", why)
+        self.run_main("--apply")
+        self.assertTrue(os.path.exists(p))
+        code, out = self.run_main("--backup", p)
+        self.assertEqual(code, 0, out)
+        self.assertIn(x, self.sh("git", "-C", self.repo, "for-each-ref", "--format=%(objectname)", "refs/tags/backup/"))
+
+    def test_file_appearing_after_recheck_is_not_force_removed(self):
+        p = self.wt("race")
+        orig, calls = tidy.walk, []
+
+        def walk(path):
+            res = orig(path)
+            calls.append(path)
+            if path == p and calls.count(p) == 2:  # the recheck inside apply, after its git status
+                with open(os.path.join(p, "new.txt"), "w") as f:
+                    f.write("fresh work")
+            return res
+        tidy.walk = walk
+        try:
+            self.run_main("--apply")
+        finally:
+            tidy.walk = orig
+        self.assertTrue(os.path.exists(os.path.join(p, "new.txt")))
+
+    def test_session_without_state_json_is_ask(self):
+        p = self.wt("sess", "-b", "worktree-sess")
+        self.agents([{"id": "nostate1", "cwd": p, "kind": "background", "state": "done", "name": "n", "startedAt": 0}])
+        self.assertEqual(self.scan()[1]["nostate1"]["action"], "ask")
+
+    def test_session_cwd_inside_a_dirty_worktree_is_ask(self):
+        p = self.wt("sess")
+        with open(os.path.join(p, "u.txt"), "w") as f:
+            f.write("untracked")
+        row = self.job("s1", "done")
+        row["cwd"] = p
+        self.agents([row])
+        self.assertEqual(self.scan()[1]["s1"]["action"], "ask")
+
+    def test_branch_check_with_cwd_gone_is_ask(self):
+        p = self.wt("gone", "-b", "worktree-gone")
+        self.commit(p, "unpushed")
+        row = self.job("gone1", "done", worktree=p, branch="worktree-gone")
+        row["cwd"] = p
+        shutil.rmtree(p)
+        self.sh("git", "-C", self.repo, "worktree", "prune")
+        self.agents([row])
+        self.assertEqual(self.scan()[1]["gone1"]["action"], "ask")
+
+    def test_session_resumed_after_scan_is_not_removed(self):
+        self.agents([self.job("r1", "done")])
+        real_sessions, n = tidy.sessions, []
+
+        def resumed():  # first call (the scan) sees it done; later calls see it working
+            n.append(1)
+            if len(n) > 1:
+                self.agents([self.job("r1", "working")])
+            return real_sessions()
+        tidy.sessions = resumed
+        try:
+            code, out = self.run_main("--apply")
+        finally:
+            tidy.sessions = real_sessions
+        self.assertIn("changed since the scan", out)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "rm.log")))
+
+
 class Offline(Base):
+    def test_interactive_session_bridge_is_found(self):
+        d = os.path.join(os.environ["HOME"], ".claude", "sessions")
+        os.makedirs(d)
+        with open(os.path.join(d, f"{os.getpid()}.json"), "w") as f:
+            json.dump({"pid": os.getpid(), "name": "me", "bridgeSessionId": "session_abc"}, f)
+        self.assertTrue(tidy.local_bridges()["abc"][2])
+
     def test_delete_only_listed_rows_not_tied_to_live_sessions(self):
         rows = [{"id": "cse_dead", "title": "old"}, {"id": "cse_live", "title": "busy"}]
         calls = []
         saved = tidy.offline_rows, tidy.api, tidy.local_bridges
         tidy.offline_rows = lambda: [r for r in rows if r["id"] not in calls_ids(calls)]
         tidy.api = lambda m, p: (calls.append((m, p)), (200, {}))[1]
-        tidy.local_bridges = lambda: {"cse_live": ("j1", "busy", True)}
+        tidy.local_bridges = lambda: {"live": ("j1", "busy", True)}
         try:
             code, out = self.run_main("offline", "--delete", "cse_live", "cse_unknown", "https://claude.ai/code/session_dead")
         finally:

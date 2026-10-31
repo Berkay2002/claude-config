@@ -7,8 +7,9 @@
   tidy.py --backup PATH       Ask worktree: tag detached commits, save changes as a patch, then remove it
   tidy.py offline [--delete|--archive ID ...]   list (or delete/archive) offline Remote Control rows
 
-Never deletes a local branch, never touches a repo's main working tree, never deletes or archives a
-Remote Control row on its own.
+Never deletes a local branch itself, never touches a repo's main working tree, never deletes or archives a
+Remote Control row on its own. `claude rm` can delete a session's own worktree branch, so a session is only
+removed when that branch has nothing unpushed.
 Config: ~/.claude/tidy.json {"roots": [...], "keep": [...], "min_age_hours": 24} (created if missing).
 """
 import argparse
@@ -72,7 +73,8 @@ def load_conf():
 def git(cwd, *args):
     # GIT_OPTIONAL_LOCKS=0: `git status` must not rewrite the index, or every run would reset the age check.
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
-    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env)
+    # core.fsmonitor=false: a repo's own config must not make a scan run a command (fsmonitor hooks run on status).
+    p = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", cwd, *args], capture_output=True, text=True, env=env)
     if p.returncode:
         last = p.stderr.strip().splitlines()
         raise GitError(f"git {args[0]}: {last[-1] if last else f'exit {p.returncode}'}")
@@ -208,7 +210,7 @@ def sessions():
             "id": sid, "name": s.get("name") or "", "kind": kind, "state": state, "live": live,
             "paths": paths, "worktree": real(st["worktreePath"]) if st.get("worktreePath") else None,
             "jobdir": real(jobdir) if jobdir else None, "bridge": st.get("bridgeSessionId"),
-            "branch": st.get("worktreeBranch"), "cwd": s.get("cwd"),
+            "branch": st.get("worktreeBranch"), "cwd": s.get("cwd"), "state_ok": bool(st),
             "updated": parse_ts(st.get("lastTerminalAt") or st.get("updatedAt")) or parse_ts(s.get("startedAt")),
         })
     return res, None
@@ -258,6 +260,33 @@ def unpushed(repo, sha):
         plus = {line[2:] for line in git(repo, "cherry", d, sha).splitlines() if line.startswith("+ ")}
         revs = [r for r in revs if r in plus]
     return revs
+
+
+def shas_in(path):
+    """Object names in the first two columns of a reflog file, or of every file (reflogs, loose refs) below a dir."""
+    files = [path] if os.path.isfile(path) else [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs]
+    out = set()
+    for fn in files:
+        try:
+            with open(fn) as f:
+                for line in f:
+                    out.update(x for x in line.split()[:2] if re.fullmatch(r"[0-9a-f]{40}", x))
+        except OSError:
+            pass
+    out.discard("0" * 40)
+    return out
+
+
+def reflog_lost(wt):
+    """(commits, tips) that only this worktree's HEAD reflog or private refs hold: they go with its admin dir."""
+    if not wt["admin"]:
+        return [], []
+    kept = shas_in(os.path.join(wt["common"], "logs", "refs", "heads"))  # branch reflogs survive the removal
+    tips = (shas_in(os.path.join(wt["admin"], "logs")) | shas_in(os.path.join(wt["admin"], "refs"))) - kept - {wt["head"]}
+    if not tips:
+        return [], []
+    lost = git(wt["repo"], "rev-list", *sorted(tips), "--not", "--remotes", "--branches", "--tags", *sorted(kept)).split()
+    return lost, sorted(tips & set(lost))  # a tip outside `lost` is reachable from a kept ref, and so are its ancestors
 
 
 def git_status(path):
@@ -319,6 +348,9 @@ def classify(wt, conf, procs, sess, now=None):
             n = len(unpushed(wt["repo"], wt["head"]))
             if n:
                 ask.append(f"{n} unpushed commit(s)" + (" on detached HEAD" if wt["detached"] else f" on {wt['branch']}"))
+        lost = reflog_lost(wt)[0]
+        if lost:
+            ask.append(f"{len(lost)} commit(s) only in this worktree's HEAD reflog")
     except GitError as e:
         keep.append(f"git error: {e}")
     if exists and not keep:
@@ -332,11 +364,16 @@ def classify(wt, conf, procs, sess, now=None):
 
 def branch_risk(s):
     """claude rm can delete the session's worktree branch; refuse when that branch holds unpushed commits."""
-    if not s["branch"] or not s["cwd"]:
+    if not s["branch"]:
         return None
+    if not s["cwd"] or not os.path.isdir(s["cwd"]):
+        return f"cannot check branch {s['branch']}: session cwd {s['cwd']} is gone"
     try:
-        if subprocess.run(["git", "-C", s["cwd"], "rev-parse", "-q", "--verify", f"refs/heads/{s['branch']}"], capture_output=True).returncode:
-            return None
+        rc = subprocess.run(["git", "-C", s["cwd"], "rev-parse", "-q", "--verify", f"refs/heads/{s['branch']}"], capture_output=True).returncode
+        if rc == 1:
+            return None  # branch no longer exists
+        if rc:
+            return f"cannot check branch {s['branch']} (git exit {rc})"
         n = len(unpushed(s["cwd"], f"refs/heads/{s['branch']}"))
         return f"branch {s['branch']} has {n} unpushed commit(s)" if n else None
     except GitError as e:
@@ -356,17 +393,20 @@ def classify_sessions(sess, wts, conf, now=None):
         if s["live"]:
             row["action"], row["reason"] = "live", "running or waiting; report only"
         else:
-            mine = [w for w in wts if (s["worktree"] and w["real"] == s["worktree"]) or (s["jobdir"] and inside(w["real"], s["jobdir"]))]
+            mine = [w for w in wts if (s["worktree"] and w["real"] == s["worktree"]) or any(inside(x, w["real"]) for x in s["paths"])
+                    or (s["jobdir"] and inside(w["real"], s["jobdir"]))]
             bad = [w for w in mine if w["cls"] != "safe"]
-            if s["worktree"] and s["worktree"] not in by_path and os.path.exists(s["worktree"]):
+            if not s["state_ok"]:
+                row["action"], row["reason"] = "ask", "no readable ~/.claude/jobs/<id>/state.json: its worktree is unknown"
+            elif s["worktree"] and s["worktree"] not in by_path and os.path.exists(s["worktree"]):
                 row["action"], row["reason"] = "ask", f"worktree {s['worktree']} exists but is not registered"
             elif bad:
                 w = bad[0]
                 row["action"], row["reason"] = "ask", f"worktree {w['path']} is {w['cls']}: {'; '.join(w['reasons'])}"
             elif (b := branch_risk(s)):
                 row["action"], row["reason"] = "ask", b
-            elif age is not None and age < conf["min_age_hours"]:
-                row["action"], row["reason"] = "keep", f"finished {age:.0f}h ago"
+            elif age is None or age < conf["min_age_hours"]:
+                row["action"], row["reason"] = "keep", f"finished {age:.0f}h ago" if age is not None else "finish time unknown"
             else:
                 row["action"], row["reason"] = "rm", "finished; worktree " + ("safe" if mine else "gone or none")
         res.append(row)
@@ -434,6 +474,11 @@ def apply(conf, quiet=False):
     for s in srows:
         if s["action"] != "rm":
             continue
+        now_sess, _ = sessions()  # it may have been resumed since the scan
+        cur = [x for x in now_sess or [] if x["id"] == s["id"]]
+        if not cur or cur[0]["live"] or cur[0]["updated"] != s["updated"]:
+            lines.append(f"skip session {s['id']} {s['name']}: changed since the scan")
+            continue
         # claude rm refuses dirty/unpushed worktrees itself; never pass --discard-unpushed or --force-remove-worktree.
         p = subprocess.run([exe, "rm", s["id"]], capture_output=True, text=True, timeout=300)
         msg = (p.stdout + p.stderr).strip().replace("\n", " | ")[:300]
@@ -448,10 +493,7 @@ def apply(conf, quiet=False):
             lines.append(f"skip {w['path']}: no longer safe ({'; '.join(fresh[0]['reasons']) if fresh else 'gone'})")
             continue
         try:
-            try:
-                git(w["repo"], "worktree", "remove", w["path"])
-            except GitError:
-                git(w["repo"], "worktree", "remove", "--force", w["path"])  # submodules or ignored files; status was clean
+            git(w["repo"], "worktree", "remove", w["path"])  # never --force: git's own dirty check is the last guard
             lines.append(f"removed {w['path']} ({human(w['size'] or 0)})")
         except GitError as e:
             lines.append(f"failed {w['path']}: {e}")
@@ -488,20 +530,30 @@ def backup(conf, path):
         return 1
     name, stamp = safe_name(os.path.basename(w["path"].rstrip("/"))), time.strftime("%Y%m%d-%H%M%S")
     done = []
+    def tag(sha, suffix=""):
+        ref = f"refs/tags/backup/wt-{name}{suffix}"
+        if subprocess.run(["git", "-C", w["repo"], "rev-parse", "-q", "--verify", ref], capture_output=True).returncode == 0:
+            ref += f"-{stamp}"
+        git(w["repo"], "update-ref", ref, sha, "")  # "" = must not exist yet; never overwrite a backup
+        done.append(f"tagged {sha[:8]} as {ref.removeprefix('refs/tags/')}")
+
     try:
         if w["detached"] and w["head"] and unpushed(w["repo"], w["head"]):
-            tag = f"refs/tags/backup/wt-{name}"
-            if subprocess.run(["git", "-C", w["repo"], "rev-parse", "-q", "--verify", tag], capture_output=True).returncode == 0:
-                tag += f"-{stamp}"
-            git(w["repo"], "update-ref", tag, w["head"], "")  # "" = must not exist yet; never overwrite a backup
-            done.append(f"tagged {w['head'][:8]} as {tag.removeprefix('refs/tags/')}")
+            tag(w["head"])
         elif w["branch"]:
-            done.append(f"commits stay on branch {w['branch']} (branches are never deleted)")
+            done.append(f"commits stay on branch {w['branch']}")
+        for sha in reflog_lost(w)[1]:
+            tag(sha, f"-reflog-{sha[:8]}")
         if exists and any(git_status(w["path"])):
             git(w["path"], "add", "-A", "-N")  # intent-to-add, so new files land in the patch too
-            patch = git(w["path"], "diff", "HEAD", "--binary")
+            # plumbing-safe diff: user config (color, noprefix, external diff, textconv) must not shape the patch
+            patch = git(w["path"], "diff", "HEAD", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
+                        "--src-prefix=a/", "--dst-prefix=b/")
             if not patch.strip():
                 raise GitError("changes found but the patch came out empty")
+            check = subprocess.run(["git", "-C", w["path"], "apply", "-R", "--check", "--binary"], input=patch, text=True, capture_output=True)
+            if check.returncode:
+                raise GitError(f"patch does not reverse-apply cleanly: {check.stderr.strip()[:200]}")
             d = home("worktree-backups")
             os.makedirs(d, exist_ok=True)
             f = os.path.join(d, f"{safe_name(os.path.basename(w['repo']))}-{name}.patch")
@@ -564,26 +616,51 @@ def link(rid):
 
 
 def local_bridges():
-    """{bridge id: (job id, name, live)} from ~/.claude/jobs; live is None when the session list failed."""
+    """{bridge key: (session, name, live)} from ~/.claude/jobs (background) and ~/.claude/sessions (interactive).
+    Keyed by the part after cse_/session_; live is None when the session list failed."""
     sess, _ = sessions()
     live = {s["id"]: s["live"] for s in sess or []}
-    res, jobs = {}, home(".claude", "jobs")
-    for j in os.listdir(jobs) if os.path.isdir(jobs) else []:
-        try:
-            with open(os.path.join(jobs, j, "state.json")) as f:
-                st = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if st.get("bridgeSessionId"):
-            res[st["bridgeSessionId"]] = (j, st.get("name", ""), live.get(j, False) if sess is not None else None)
+    res = {}
+    for kind in ("jobs", "sessions"):
+        d = home(".claude", kind)
+        for e in os.listdir(d) if os.path.isdir(d) else []:
+            f = os.path.join(d, e, "state.json") if kind == "jobs" else os.path.join(d, e)
+            if kind == "sessions" and not e.endswith(".json"):
+                continue
+            try:
+                with open(f) as fh:
+                    st = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            b = st.get("bridgeSessionId")
+            if not isinstance(b, str) or "_" not in b:
+                continue
+            if kind == "jobs":
+                res[bridge_key(b)] = (e, st.get("name", ""), live.get(e, False) if sess is not None else None)
+            else:
+                res[bridge_key(b)] = (f"pid {st.get('pid')}", st.get("name", ""), pid_alive(st.get("pid")))
     return res
+
+
+def bridge_key(rid):
+    return rid.split("_", 1)[1]
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def offline(ids, delete=False):
     rows, local = offline_rows(), local_bridges()
     if not ids:
         for r in rows:
-            j = local.get(r["id"])
+            j = local.get(bridge_key(r["id"]))
             note = ""
             if j:
                 note = f"  [local session {j[0]} is finished: claude rm it first]" if j[2] is False else f"  [local session {j[0]} may be live: leave it]"
@@ -593,7 +670,7 @@ def offline(ids, delete=False):
     known, code, acted = {r["id"]: r for r in rows}, 0, []
     for i in ids:
         i = "cse_" + i.rsplit("session_", 1)[1] if "session_" in i else i  # a claude.ai/code link works too
-        j = local.get(i)
+        j = local.get(bridge_key(i))
         if i not in known:
             print(f"refused {i}: not an offline row right now", file=sys.stderr); code = 1
         elif j and (j[2] or j[2] is None):
