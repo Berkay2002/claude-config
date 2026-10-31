@@ -95,6 +95,12 @@ Rule of thumb: a subagent for minutes, a background session for hours, a team on
 | Dozens+ of uniform units (repo-wide audit, mass migration), findings that should be adversarially verified, or a plan worth drafting from several angles | workflow: never launch one unasked, but **proactively suggest it** | haiku per unit, opus to verify |
 Workers in any mode may use their own subagents. Say which mode you picked and why in one line.
 
+Where worktrees and sessions live: worktrees only under `<repo>/.claude/worktrees/<name>` (`--worktree`, `EnterWorktree`),
+never as sibling folders next to a repo or checkouts in `/tmp`. Throwaway checkouts (before/after proofs, image builds) go
+in the session scratchpad and are removed in the same turn. Background sessions are named `<repo>-<name>`; retire each
+with `claude rm` once its work is merged or pushed. Cleanup goes through the `tidy` skill: a daily cron (`tidy.py --auto`)
+removes only what is safe, and `/tidy` walks me through the rest, including deleting the offline Remote Control rows I pick.
+
 How a cheaper worker gets Opus help (the advisor makes Sonnet/Haiku perform better on hard steps):
 | Worker | Opus help |
 |---|---|

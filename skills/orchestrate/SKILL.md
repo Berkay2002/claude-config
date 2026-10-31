@@ -75,6 +75,8 @@ Check with `claude agents --json`. Then subscribe once per worker:
 ## Housekeeping (whenever a round settles, and before reporting)
 `claude agents --json`: `claude rm` sessions *you* created that are done (never others' sessions; mention
 those to the user instead). Idle sessions still hold hundreds of MB each.
+Then run the `tidy` skill (`tidy.py report`, then `--apply`) instead of removing worktrees by hand, and walk the
+user through its Ask items.
 
 ## 7. Report to the user
 Short: what merged and deployed, how it was verified, what the user must do, who is still working.
