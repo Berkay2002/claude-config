@@ -14,6 +14,7 @@ https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 | `CLAUDE.md` | The rules: which model and effort for which job, how to split work, when to escalate, budget |
 | `agents/` | `scout` (Haiku: read, search, summarise), `scout-lead` (Sonnet: splits a big read across scouts), `builder` (Sonnet: code with a test), `reviewer` (Opus: judgement) |
 | `skills/orchestrate` | Run a feature as parallel background sessions in git worktrees, coordinated from one session |
+| `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (daily `--auto` for the safe part) |
 | `settings.shared.json` | Settings merged into `~/.claude/settings.json` on every device (your other keys stay) |
 | `install.sh`, `install.ps1` | Installers for macOS/Linux and Windows |
 
