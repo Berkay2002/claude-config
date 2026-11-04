@@ -252,11 +252,11 @@ class Controls(Base):
         self.control("apply_flag_settings", settings={"effortLevel": None})
         time.sleep(0.1)
         self.assertEqual(self.s.calls, [])
-        self.control("set_model", model="sonnet")
+        self.control("set_model", model="other")
         self.control("apply_flag_settings", settings={"effortLevel": "low"})
         self.control("apply_flag_settings", settings={"effortLevel": "low"})
         self.assertTrue(wait_for(lambda: len(self.s.calls) == 2))
-        self.assertEqual(set(self.s.calls), {("set_model", None, "low"), ("set_model", "sonnet", None)})
+        self.assertEqual(set(self.s.calls), {("set_model", None, "low"), ("set_model", "other", None)})
 
     def test_unknown_control_gets_an_error(self):
         self.control("rewind_files")
