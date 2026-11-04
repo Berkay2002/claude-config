@@ -161,7 +161,9 @@ class LiveSession:
         live = s._find()
         if live is None and start_cmd:
             # The role must outlive us: its own session, started through tmux by the role's start script.
-            subprocess.run(shlex.split(start_cmd), start_new_session=True, stdin=subprocess.DEVNULL, timeout=wait)
+            # ROLELIVE_START tells the start script it has no terminal, even when our parent runs inside tmux.
+            subprocess.run(shlex.split(start_cmd), start_new_session=True, stdin=subprocess.DEVNULL, timeout=wait,
+                           env={**os.environ, "ROLELIVE_START": "1"})
             deadline = time.time() + wait
             while live is None and time.time() < deadline:
                 time.sleep(0.5)
@@ -186,8 +188,13 @@ class LiveSession:
         return self.live.get("status")
 
     def transcript_path(self):
-        return os.path.join(self.claude_dir, "projects", re.sub(r"[/.]", "-", self.live["cwd"]),
-                            self.session_id + ".jsonl")
+        # claude names the folder after the cwd with every non-alphanumeric character as "-" (long names get a hash)
+        p = os.path.join(self.claude_dir, "projects", re.sub(r"[^a-zA-Z0-9]", "-", self.live["cwd"]),
+                         self.session_id + ".jsonl")
+        if not os.path.exists(p):
+            p = next(iter(glob.glob(os.path.join(glob.escape(self.claude_dir), "projects", "*",
+                                                 self.session_id + ".jsonl"))), p)
+        return p
 
     def start(self, since=None, state_key=None):
         """since=None reads from now on; since="saved" first replays what state_key's consumer has not seen."""
@@ -325,9 +332,12 @@ class LiveSession:
             return self._picker(model, effort)
         finally:
             after = open(settings, "rb").read() if os.path.exists(settings) else None
-            if after != before and before is not None:   # never leave a saved default behind
-                with open(settings, "wb") as f:
-                    f.write(before)
+            if after != before:   # never leave a saved default behind
+                if before is None:
+                    os.remove(settings)
+                else:
+                    with open(settings, "wb") as f:
+                        f.write(before)
                 self.notice("the model picker changed settings.json; restored it")
 
     def _picker(self, model, effort):
@@ -380,11 +390,20 @@ class LiveSession:
         """The dialog d is what the pane shows now: never press keys into the wrong dialog. Fails closed: a permission
         dialog needs an identifying hint from its input on screen, and no other open dialog may share that hint."""
         scr = self.screen()
-        flat = " ".join(scr.split())
-        if d["dialog"] == "question":
-            qs = d["input"].get("questions") or [{}]
-            return scr if " ".join(str(qs[0].get("question", "")).split())[:40] in flat else None
         lines = scr.split("\n")
+        if d["dialog"] == "question":
+            # The bottom dialog box must be this question: its text between the box's rule and the last "1." row,
+            # and that row its first option (keys start there). History above may echo the question too.
+            q = (d["input"].get("questions") or [{}])[0]
+            first = ((q.get("options") or [{}])[0]).get("label")
+            rows = [i for i, ln in enumerate(lines) if re.match(r"\s*(?:❯\s*)?1\. ", ln)]
+            if not rows or not first:
+                return None
+            row = re.sub(r"^\s*(?:❯\s*)?1\. (?:\[.\] )?", "", lines[rows[-1]]).strip()
+            top = max([i for i, ln in enumerate(lines[:rows[-1]]) if ln.lstrip().startswith("─")], default=-1)
+            region = re.sub(r"\s+", "", "".join(lines[top + 1:rows[-1]]))
+            text = re.sub(r"\s+", "", str(q.get("question", "")))
+            return scr if text and text in region and row == first else None
         yes = [i for i, ln in enumerate(lines) if re.match(r"\s*❯ 1\. Yes", ln)]
         if not yes:
             return None
@@ -718,6 +737,8 @@ class LiveSession:
         while not self.stopped:
             p = os.path.join(spool_dir(), self.session_id + ".jsonl")
             if p != path:
+                if f:
+                    f.close()
                 if not os.path.exists(p):
                     os.close(os.open(p, os.O_CREAT | os.O_WRONLY, 0o600))
                 path, f = p, open(p)
@@ -743,6 +764,8 @@ class LiveSession:
                 self._ensure_turn()
                 self.emit({"kind": "dialog_open", "id": did, "tool_use_id": d.get("tool_use_id"),
                            **{k: d[k] for k in ("dialog", "tool", "input")}})
+        if f:
+            f.close()
 
     # ---- session watch: /clear, restart, idle fallback for turn end, lost sends ----
     def _watch(self):

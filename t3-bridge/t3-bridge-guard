@@ -32,7 +32,7 @@ cleanup() {
   [ -n "$pid" ] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
   tmux kill-window -t "$TMUXS:guard" 2>/dev/null
   [ $made_session = 1 ] && tmux kill-session -t "$TMUXS" 2>/dev/null
-  rm -rf "$base" "$CLAUDE_DIR/projects/$(printf %s "$toy" | tr /. --)" "$CLAUDE_DIR/rolelive/t3-$role.json"
+  rm -rf "$base" "$CLAUDE_DIR/projects/$(printf %s "$toy" | tr -c "a-zA-Z0-9" -)" "$CLAUDE_DIR/rolelive/t3-$role.json"
   [ $fail = 0 ] && rm -f "$CLAUDE_DIR/t3-bridge/bridge-$role.log"   # kept on FAIL for the diagnosis
 }
 trap cleanup EXIT

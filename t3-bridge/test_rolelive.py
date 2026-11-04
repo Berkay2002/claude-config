@@ -191,6 +191,23 @@ class Dialogs(Base):
         self.s.answer("q1", {"Pick a colour": "Blue", "Pick toppings": "Cheese, Olives"})
         self.assertEqual(self.s.keys, ["3", "1", "3", "Tab", "Enter"])
 
+    FRUIT = [{"question": "Pick a fruit for the test", "options": [{"label": "Apple"}, {"label": "Pear"}]},
+             {"question": "Pick toppings for the test", "multiSelect": True,
+              "options": [{"label": "Salt"}, {"label": "Sugar"}]}]
+
+    def test_question_dialog_on_a_real_screen_is_answered(self):
+        self.open("q1", "AskUserQuestion", {"questions": self.FRUIT}, synthetic=False)
+        self.s.scr = screen_file("screen-question.txt")
+        self.assertTrue(self.s.answer("q1", {"Pick a fruit for the test": "Pear",
+                                             "Pick toppings for the test": "Sugar"}))
+        self.assertEqual(self.s.keys, ["2", "2", "Tab"])
+
+    def test_question_echoed_above_a_permission_dialog_is_not_answered(self):
+        self.open("q1", "AskUserQuestion", {"questions": self.FRUIT}, synthetic=False)
+        self.s.scr = "● Pick a fruit for the test\n  ⎿ Apple\n" + PERMISSION_SCREEN.format(cmd="rm -rf build")
+        self.assertFalse(self.s.answer("q1", {"Pick a fruit for the test": "Apple"}))
+        self.assertEqual(self.s.keys, [])
+
     def test_synthetic_dialog_binds_to_its_tool_use_and_closes_on_the_result(self):
         self.s._ensure_turn()
         self.open("perm-1", "Write", {"file_path": "/tmp/toy/a.txt", "content": "x"})
@@ -339,6 +356,15 @@ class Replay(Base):
             json.dump({"session_id": "older", "offset": 0}, f)
         self.run_tail("saved", 1)
         self.assertEqual(self.s.kinds(), ["notice"])
+
+    def test_transcript_folder_replaces_every_non_alphanumeric_character(self):
+        self.s.live["cwd"] = "/tmp/my_role dir+x"
+        self.assertEqual(os.path.basename(os.path.dirname(self.s.transcript_path())), "-tmp-my-role-dir-x")
+        self.s.live["cwd"] = "/tmp/" + "x" * 300   # claude hashes long names: found by session id
+        p = os.path.join(self.dir, "projects", "-tmp-xx-hash", "sid-1.jsonl")
+        os.makedirs(os.path.dirname(p))
+        open(p, "w").close()
+        self.assertEqual(self.s.transcript_path(), p)
 
     def test_state_file_is_private_and_atomic(self):
         self.s.state_key = "t3-toy"

@@ -1,0 +1,22 @@
+✻ Cooked for 3s · done 10:36 PM
+
+❯ Use the AskUserQuestion tool once with two questions: "Pick a fruit for the test" (options Apple, Pear) and "Pick toppings for the test" (multiSelect,
+  options Salt, Sugar). Then say done.
+
+● Pick a fruit for the test
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Fruit  ☐ Toppings  ✔ Submit  →
+
+Pick a fruit for the test
+
+❯ 1. Apple
+     Apple
+  2. Pear
+     Pear
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── toy ─

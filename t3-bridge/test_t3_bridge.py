@@ -23,6 +23,7 @@ class FakeSession:
     def __init__(self):
         self.live = {"cwd": "/tmp/toy", "pid": 1, "version": "x"}
         self.dialogs, self.sent, self.calls, self.offsets = {}, [], [], []
+        self.ok = True
 
     def send(self, text, files=()):
         self.calls.append(("send", text))
@@ -32,6 +33,7 @@ class FakeSession:
 
     def set_model(self, model=None, effort=None):
         self.calls.append(("set_model", model, effort))
+        return self.ok
 
     def interrupt(self):
         self.calls.append(("interrupt",))
@@ -132,6 +134,22 @@ class Turns(Base):
         self.assertEqual([x["type"] for x in f], ["system", "assistant", "result"])
         self.assertIn("someone has text typed in the tmux pane", f[1]["message"]["content"][0]["text"])
         self.assertIsNone(self.b.turn)
+
+    def test_t3_message_during_a_tmux_turn_gets_its_result(self):
+        self.t3_turn()
+        self.end_turn()
+        self.ev("turn_start", origin="human", text="typed", by_us=False, peer=None)
+        self.frames()
+        self.b.on_user({"type": "user", "uuid": "t3-2", "message": {"role": "user", "content": "queued"}})
+        self.end_turn("tmux turn done")   # T3's prompt is still queued: its turn stays open
+        self.assertIsNotNone(self.b.turn)
+        self.ev("turn_start", origin="human", text="queued", by_us=True, peer=None)
+        self.end_turn("queued done")
+        f = self.frames()
+        self.assertEqual([x["type"] for x in f], ["assistant", "result", "system", "result"])
+        self.assertNotIn("user_message_uuids", f[1])
+        self.assertEqual(f[2]["user_message_uuids"], ["t3-2"])
+        self.assertEqual((f[3]["user_message_uuids"], f[3]["result"]), (["t3-2"], "queued done"))
 
 
 class Subagents(Base):
@@ -237,6 +255,18 @@ class Dialogs(Base):
         self.assertEqual(f[0]["message"]["content"][0]["id"], "perm-1")
         self.assertEqual(f[1]["message"]["content"][0]["tool_use_id"], "perm-1")
 
+    def test_dialog_before_t3_can_show_a_turn_waits_and_keeps_its_turn_open(self):
+        self.ev("turn_start", origin="human", text="typed", by_us=False, peer=None)
+        self.ev("dialog_open", id="perm-1", dialog="permission", tool="Bash", input={"command": "ls"})
+        self.assertEqual(self.frames(), [])
+        self.b.on_user({"type": "user", "uuid": "t3-1", "message": {"role": "user", "content": "hi"}})
+        self.ev("send_failed", text="hi", reason="dialog")
+        f = self.frames()
+        self.assertEqual([x["type"] for x in f][-3:], ["system", "assistant", "control_request"])
+        self.assertIsNotNone(self.b.turn)   # the wake turn waits on the dialog
+        self.respond(f[-1]["request_id"], behavior="allow", decisionClassification="user_temporary")
+        self.assertEqual(self.answers(), [("answer", "perm-1", "allow")])
+
     def test_dialog_for_a_call_t3_has_uses_its_id(self):
         self.t3_turn()
         self.ev("dialog_open", id="perm-2", dialog="permission", tool="Bash", input={}, tool_use_id="t9")
@@ -257,6 +287,13 @@ class Controls(Base):
         self.control("apply_flag_settings", settings={"effortLevel": "low"})
         self.assertTrue(wait_for(lambda: len(self.s.calls) == 2))
         self.assertEqual(set(self.s.calls), {("set_model", None, "low"), ("set_model", "other", None)})
+
+    def test_refused_switch_is_retried_when_t3_repeats_it(self):
+        self.s.ok = False
+        self.control("set_model", model="other")
+        self.assertTrue(wait_for(lambda: len(self.s.calls) == 1 and not self.b.applying))
+        self.control("set_model", model="other")
+        self.assertTrue(wait_for(lambda: len(self.s.calls) == 2))
 
     def test_unknown_control_gets_an_error(self):
         self.control("rewind_files")

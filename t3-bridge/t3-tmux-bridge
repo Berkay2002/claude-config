@@ -94,6 +94,7 @@ class Bridge:
         self.lock = threading.RLock()
         self.model = self.flag("--model") or "unknown"
         self.want = {"model": self.flag("--model"), "effort": self.flag("--effort")}   # what T3 last asked for
+        self.applying = set()   # (key, value) switches a worker thread is applying now
         self.permission_mode = self.flag("--permission-mode") or "default"
         self.turn = None            # {"t3_uuid", "started", "last_text", "landed"}: the T3 turn the stream is inside
         self.routable = False       # T3 has sent a prompt on this process
@@ -203,8 +204,6 @@ class Bridge:
                 return
             if k == "send_failed":
                 return self.send_failed(ev)
-            if k in ("dialog_open", "dialog_closed"):
-                return self.dialog(ev)
             if not self.wakeable and not (self.turn and self.turn["t3_uuid"]):
                 return self.hold(ev)   # T3 can't show an unsolicited turn yet
             self.deliver(ev)
@@ -224,18 +223,21 @@ class Bridge:
             self.dropped = 0
         for ev in held:
             self.deliver(ev)
-        if self.turn is not None and not self.turn["t3_uuid"]:
-            self.close_turn()   # a held turn that is still running carries on as a wake turn
+        if self.turn is not None and not self.turn["t3_uuid"] and not self.requests:
+            self.close_turn()   # a held turn still running carries on as wake turns; one waiting on a dialog stays open
 
     def deliver(self, ev):
         k = ev["kind"]
         parent = ev.get("parent_tool_use_id")
+        if k in ("dialog_open", "dialog_closed"):
+            return self.dialog(ev)
         if k == "turn_start":
             return self.turn_start(ev)
         if k == "turn_end":
             if self.turn is not None:
                 self.turn["last_text"] = ev["last_text"]
-                self.close_turn(ev["reason"] == "interrupted")
+                if not (self.turn["t3_uuid"] and not self.turn["landed"]):   # T3's queued prompt is still to come
+                    self.close_turn(ev["reason"] == "interrupted")
             if (ev.get("offset") or 0) > self.offset:
                 self.offset = ev["offset"]
                 self.s.save_offset(self.offset)   # the transcript is delivered up to here
@@ -338,13 +340,18 @@ class Bridge:
 
     def change(self, model=None, effort=None):
         """Apply only what T3 changed during this process: T3 repeats its pick on every turn and at spawn."""
-        if model is not None and model != self.want["model"]:
-            self.want["model"] = model
-        elif effort is not None and effort != self.want["effort"]:
-            self.want["effort"] = effort
-        else:
+        key, value = ("model", model) if model is not None else ("effort", effort)
+        if value is None or value == self.want[key] or (key, value) in self.applying:
             return
-        threading.Thread(target=self.s.set_model, args=(model, effort), daemon=True).start()
+        self.applying.add((key, value))
+
+        def apply():
+            ok = self.s.set_model(model, effort)
+            with self.lock:
+                self.applying.discard((key, value))
+                if ok:
+                    self.want[key] = value   # a refused switch is retried when T3 repeats its pick
+        threading.Thread(target=apply, daemon=True).start()
 
     def on_control(self, msg):
         req, rid = msg.get("request", {}), msg.get("request_id")
@@ -382,10 +389,12 @@ class Bridge:
 
     def on_control_response(self, msg):
         resp = msg.get("response", {})
-        did = self.requests.pop(resp.get("request_id"), None)
+        with self.lock:   # not around answer(): the core's reader thread takes its lock, then ours
+            did = self.requests.pop(resp.get("request_id"), None)
+            if did is not None:
+                self.by_dialog.pop(did, None)
         if did is None:
             return self.log("control_response for unknown request")
-        self.by_dialog.pop(did, None)
         body = resp.get("response") or {}
         cls, behavior = body.get("decisionClassification"), body.get("behavior")
         self.log("decision", did, resp.get("subtype"), behavior, cls)
@@ -425,9 +434,12 @@ class Bridge:
             text = "\n".join(parts)
         with self.lock:
             self.routable = True
-            if self.turn is not None:
+            if self.turn is not None and self.turn["t3_uuid"]:
                 self.notice("T3 message sent while a turn was running; the live session queues it")
             else:
+                if self.turn is not None:
+                    self.notice("a turn typed in tmux/RC is running; the live session queues this message")
+                    self.close_turn()   # the rest of that turn shows in T3's turn, which ends after T3's prompt
                 self.open_turn(msg.get("uuid") or str(uuid.uuid4()))
         threading.Thread(target=self.s.send, args=(text, files), daemon=True).start()   # may wait for a draft
 

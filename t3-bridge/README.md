@@ -41,7 +41,8 @@ The bridge logs to `<claude dir>/t3-bridge/bridge-<role>.log` (0700 dir, 0600 fi
 
 ## Core interface (`rolelive.LiveSession`)
 - `attach(role=None, session_id=None, start_cmd=None, claude_dir=None, tmux_session=None)`, then `start(since=None |
-  "saved", state_key=None)` and `close()`. `save_offset(offset)` records what the consumer delivered.
+  "saved", state_key=None)` and `close()`. A missing role is started with `start_cmd` and `ROLELIVE_START=1` in its
+  environment (no terminal); the start script must put the role in tmux. `save_offset(offset)` records what the consumer delivered.
 - `send(text, files=())`: waits up to 5 s for an empty input line, never types over a draft or into a dialog.
 - `interrupt()`, `answer(id, choice)` (`{question: label}`, `"a, b"` for multiSelect, free text, `"allow"`, `"deny"`),
   `set_model(model=None, effort=None)`, `status()`.
@@ -76,4 +77,6 @@ claude or T3) and `node --test t3rpc.test.mjs`.
 - Several T3 threads on one role all mirror it and can all send; a dialog answered from one closes in the others.
 - Agents that were already running when the bridge attached are not shown. A lost send is noticed only once the
   session has been idle for 45 s.
-- Hook spool files in `$XDG_RUNTIME_DIR/t3-bridge/` are not cleaned up (they go with the runtime dir at logout).
+- Hook spool files in `$XDG_RUNTIME_DIR/t3-bridge/` hold each dialog's full tool input and are not cleaned up
+  (they go with the runtime dir at logout).
+- A question is answered from T3 only while the dialog box on screen shows its first question and first option.
