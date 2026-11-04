@@ -2,8 +2,8 @@
 
 Read this instead of the `claude --bg` steps in SKILL.md when a piece of work should go to a Codex session. It needs the
 `agent-mail` MCP server (see `agent-mail/README.md` for registration) and an orchestrator started with
-`AGENT_MAIL_NAME=<you> claude --dangerously-load-development-channels server:agent-mail`. A `--bg` orchestrator gets no
-push: it calls `inbox` after each step.
+`AGENT_MAIL_NAME=<you> claude --dangerously-load-development-channels server:agent-mail`. Without that flag (a `--bg`
+orchestrator) there is no push and the mail waits: call `inbox` after each step.
 
 ## 1. Brief
 Same rules as step 3 of SKILL.md (goal, files, test that proves it, report format), plus:
@@ -25,8 +25,9 @@ the shared ladders (Codex models are not on them: pick what the user names, else
 ## 3. While it works
 `send(to="<name>", text="…")` queues a message; messages that arrive during a turn are joined (each prefixed
 `From <sender>:`) into the next turn. `list` shows state (`running`, `idle`, `failed`) and thread ids. Don't poll.
-`error` mail means the turn failed (exit code and log path in the text): read the log, then `send` a corrected
-instruction (the thread resumes) or relaunch with a new name.
+`error` mail means the turn failed (exit code, timeout or dead runner, and the log path in the text): read the log,
+then `send` a corrected instruction (the thread resumes) or relaunch with a new name. After a dead-runner `error` the
+interrupted messages run again on their own; the `turn_end` follows.
 
 ## 4. Report and merge
 Same as step 6 of SKILL.md: `git log main..`, `git diff main...`, merge `--no-ff`, run checks. The worker's last message

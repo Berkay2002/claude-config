@@ -13,15 +13,16 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `list()` | Workers (state, thread id, cwd, last message's first line) and this inbox's unread count. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
 
-Mail kinds: `message`, `turn_end` (the worker's last message), `error` (nonzero exit, `turn.failed`, or no last
-message; the text names the exit code and the log). Silence never means success.
+Mail kinds: `message`, `turn_end` (the worker's last message), `error` (nonzero exit, `turn.failed`, no last
+message, a turn over 4 hours, or a runner that died; the text names the cause and the log). Silence never means
+success. Names (workers and inboxes) are letters, digits, `_` and `-`.
 
 ## Environment (nothing defaults to `~`)
 
 - `AGENT_MAIL_DIR`: absolute mail root, **on local disk** (on the VDI: a folder under `/repo/$USER/`, never `/home`, which
   is a size-limited NFS share). Missing: every tool returns a clear error and nothing is created.
 - `AGENT_MAIL_NAME`: who this instance is. Without it `send` still works (from `unknown`) but there is no inbox,
-  no push and no `claude/channel` capability.
+  no push and no `claude/channel` capability. An invalid name makes every tool fail.
 - `AGENT_MAIL_CODEX`: the codex binary (default `codex` on PATH). `CODEX_HOME`: passed through to every worker turn
   (on the VDI the real one is the folder `/repo/$USER/codex`; a stray `.codex` has no auth).
 - `AGENT_MAIL_POLL`: inbox poll seconds (default 1).
@@ -63,11 +64,15 @@ alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" 
 - Mail: one JSON file per message in `inbox/<name>/new/`, written atomically; a reader claims it by renaming it to
   `cur/`, so it is delivered exactly once even with two readers, and mail sent while no reader ran is delivered when
   one starts. Push to Claude is a `notifications/claude/channel` notification, sent only when the client is
-  `claude-code` (Codex is `codex-mcp-client` and only gets the `inbox` tool).
+  `claude-code` and that Claude was started with `--dangerously-load-development-channels server:agent-mail`
+  (otherwise Claude drops the push, so the mail stays for `inbox`). Codex is `codex-mcp-client` and only gets `inbox`.
 - Workers: `workers/<name>.json` (state `starting | running | idle | failed`), `workers/<name>/queue/`, logs per turn
   in `workers/<name>/logs/`. A detached runner (`agent_mail.py run <name>`, one at a time per worker via `flock`)
   runs `codex exec --json`, later turns `codex exec resume <thread_id>`, several queued messages joined into one
   turn, each prefixed `From <sender>:`. It exits when the queue is empty; `send` starts it again.
+- A runner that dies mid-turn takes its codex with it. The owner's push thread (and any `list`) notices the dead
+  runner and starts a new one, which mails the owner an `error` and runs the interrupted messages again. A turn is
+  delivered at least once: a crash in the instant between mailing the result and clearing the turn replays it.
 - Every turn re-injects the agent-mail server with `-c mcp_servers.agent-mail.*` (command, args, name, dir, plus
   `CODEX_HOME` and `AGENT_MAIL_CODEX`, because Codex hands MCP servers a filtered env).
 
@@ -96,5 +101,6 @@ A fake `codex`, a temp mail dir and temp HOME; nothing reaches the real codex, m
 
 ## Known limits
 
-No per-turn timeout (a hung codex keeps its runner); no `retire` tool (delete `workers/<name>*` by hand); `codex queue`
-is unreliable and unused.
+A turn is killed after 4 hours (`TURN_TIMEOUT`); shell commands a killed codex started can outlive it. No `retire`
+tool (delete `workers/<name>*` by hand). `codex queue` is unreliable and unused. A Claude that declines the channel
+dialog still gets pushes it drops: answer yes, or start it without the flag and use `inbox`.
