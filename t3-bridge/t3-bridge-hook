@@ -1,4 +1,4 @@
-#!/usr/bin/python3.11
+#!/usr/bin/env python3.11
 # Claude Code hook for a role session mirrored into T3: records PreToolUse(AskUserQuestion) and PermissionRequest
 # events in a spool file the bridge tails. Never decides anything: the TUI dialog still shows (tmux and RC can answer).
 import json, os, sys
@@ -8,7 +8,8 @@ try:
     os.makedirs(d, mode=0o700, exist_ok=True)
     keep = {k: ev.get(k) for k in ("hook_event_name", "session_id", "tool_name", "tool_input", "tool_use_id",
                                     "permission_suggestions")}
-    with open(os.path.join(d, f"{ev['session_id']}.jsonl"), "a") as f:
+    fd = os.open(os.path.join(d, f"{ev['session_id']}.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
         f.write(json.dumps(keep) + "\n")
 except Exception as e:
     print(f"t3-bridge-hook: {e!r}", file=sys.stderr)

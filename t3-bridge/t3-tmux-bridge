@@ -1,31 +1,36 @@
-#!/usr/bin/python3.11
+#!/usr/bin/env python3.11
 """T3 Code adapter over rolelive: set this as a T3 Claude provider instance's binary path.
 
 T3 thinks it runs `claude --input-format stream-json ...` (Agent SDK protocol). This program translates that protocol
 to and from a rolelive.LiveSession, i.e. a claude already running in tmux. It never starts claude on the session.
   --version, or argv without --session-id/--resume (T3's health probe): exec the real claude unchanged.
   otherwise: mirror the role named by --bridge-role (launch args), starting it with --bridge-start if it isn't running.
+Bridge launch args: --bridge-role ROLE, --bridge-start CMD, --bridge-tmux-session NAME (only sessions in this tmux
+session), --bridge-claude-dir DIR (the role's claude config dir; default $CLAUDE_CONFIG_DIR, else ~/.claude).
+Env: T3_BRIDGE_CLAUDE (the real claude; default `claude` next to this link, else PATH), T3_BRIDGE_DEBUG=1 (log frames).
 """
 import base64, json, os, sys, threading, time, uuid
 
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
 import rolelive  # noqa: E402
 
-REAL_CLAUDE = os.environ.get("T3_BRIDGE_CLAUDE", "claude")
-LOG_DIR = os.environ.get("T3_BRIDGE_LOG_DIR", os.path.join(rolelive.HOME, ".cache", "t3-bridge"))
+BRIDGE_FLAGS = {"--bridge-role", "--bridge-start", "--bridge-tmux-session", "--bridge-claude-dir"}
 VALUE_FLAGS = {"--output-format", "--input-format", "--thinking", "--thinking-display", "--effort", "--model",
                "--permission-prompt-tool", "--allowedTools", "--disallowedTools", "--tools", "--permission-mode",
                "--add-dir", "--session-id", "--resume", "--settings", "--setting-sources", "--append-system-prompt",
-               "--max-turns", "--fallback-model", "--mcp-config", "--max-thinking-tokens", "--bridge-role",
-               "--bridge-start"}
+               "--max-turns", "--fallback-model", "--mcp-config", "--max-thinking-tokens"} | BRIDGE_FLAGS
 BOOL_FLAGS = {"--verbose", "--include-partial-messages", "--allow-dangerously-skip-permissions",
               "--strict-mcp-config", "--dangerously-skip-permissions", "--no-session-persistence"}
 # Flags T3 always sends that the live session can't (or needn't) honour: logged, not shown.
 EXPECTED_FLAGS = {"--output-format", "--input-format", "--verbose", "--include-partial-messages", "--session-id",
-                  "--resume", "--thinking", "--thinking-display", "--strict-mcp-config", "--bridge-role",
-                  "--bridge-start", "--allow-dangerously-skip-permissions", "--dangerously-skip-permissions",
-                  "--model", "--effort", "--permission-mode", "--permission-prompt-tool", "--allowedTools", "--tools",
-                  "--add-dir", "--settings", "--setting-sources"}
+                  "--resume", "--thinking", "--thinking-display", "--strict-mcp-config",
+                  "--allow-dangerously-skip-permissions", "--dangerously-skip-permissions", "--model", "--effort",
+                  "--permission-mode", "--permission-prompt-tool", "--allowedTools", "--tools", "--add-dir",
+                  "--settings", "--setting-sources"} | BRIDGE_FLAGS
+HUMAN_ALLOW = {"user_temporary", "user_permanent"}   # T3's decisionClassification when a person pressed Approve
+REPLAY_CAP = 2000          # events kept while T3 can't take unsolicited turns yet
+DEPLOY_POLL = 2.0
 
 
 def parse_argv(argv):
@@ -48,30 +53,63 @@ def parse_argv(argv):
 def strip_bridge_flags(argv):
     out, skip = [], False
     for a in argv:
-        if skip or a.startswith(("--bridge-role=", "--bridge-start=")):
+        if skip or a.split("=", 1)[0] in BRIDGE_FLAGS and "=" in a:
             skip = False
             continue
-        skip = a in ("--bridge-role", "--bridge-start")
+        skip = a in BRIDGE_FLAGS
         if not skip:
             out.append(a)
     return out
 
 
+def real_claude():
+    """T3_BRIDGE_CLAUDE, else `claude` next to the link T3 runs (not next to this file), else PATH."""
+    env = os.environ.get("T3_BRIDGE_CLAUDE")
+    if env:
+        return env
+    near = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "claude")
+    if os.access(near, os.X_OK) and os.path.realpath(near) != os.path.realpath(sys.argv[0]):
+        return near
+    return "claude"
+
+
+def private_file(path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(path, 0o600)
+    return os.fdopen(fd, "a", buffering=1)
+
+
 class Bridge:
-    def __init__(self, flags, unknown):
+    def __init__(self, flags, unknown, out=None, session=None):
         self.flags, self.unknown = flags, unknown
-        self.role = (flags.get("--bridge-role") or [""])[0]
-        os.makedirs(LOG_DIR, exist_ok=True)
-        self.logf = open(os.path.join(LOG_DIR, f"bridge-{self.role or 'unknown'}.log"), "a", buffering=1)
+        self.role = self.flag("--bridge-role") or ""
+        self.claude_dir = self.flag("--bridge-claude-dir") or rolelive.default_claude_dir()
+        self.dir = os.path.join(self.claude_dir, "t3-bridge")
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        self.logf = private_file(os.path.join(self.dir, f"bridge-{self.role or 'unknown'}.log"))
+        self.debug = os.environ.get("T3_BRIDGE_DEBUG") == "1"
+        self.stdout = out or sys.stdout
         self.out = threading.Lock()
         self.lock = threading.RLock()
-        self.model = (flags.get("--model") or ["unknown"])[0]
-        self.permission_mode = (flags.get("--permission-mode") or ["default"])[0]
-        self.turn = None            # {"t3_uuid", "started", "last_text"}: the T3 turn the stream is inside
-        self.routable = False       # T3 routes unsolicited (wake) turns only after one of its own on this process
+        self.model = self.flag("--model") or "unknown"
+        self.want = {"model": self.flag("--model"), "effort": self.flag("--effort")}   # what T3 last asked for
+        self.permission_mode = self.flag("--permission-mode") or "default"
+        self.turn = None            # {"t3_uuid", "started", "last_text", "landed"}: the T3 turn the stream is inside
+        self.routable = False       # T3 has sent a prompt on this process
+        self.wakeable = False       # T3 opens a turn for an unsolicited init only after one of its own turns ended
+        self.held = []              # events kept until wakeable (replayed history, turns while T3 was away)
+        self.dropped = 0
         self.pending_notices = []
         self.requests = {}          # can_use_tool request_id -> dialog id
         self.by_dialog = {}
+        self.tasks = {}             # background agent id -> description (T3's background roster)
+        self.announced = set()      # agent ids whose task_started went out
+        self.offset = 0             # newest main-transcript offset whose turn T3 has got
+        self.s = session
+
+    def flag(self, name):
+        return (self.flags.get(name) or [None])[0]
 
     def log(self, *a):
         self.logf.write(time.strftime("%H:%M:%S ") + " ".join(str(x) for x in a) + "\n")
@@ -79,11 +117,16 @@ class Bridge:
     def emit(self, obj):
         line = json.dumps(obj, separators=(",", ":"))
         with self.out:
-            sys.stdout.write(line + "\n")
-            sys.stdout.flush()
-        self.log("OUT", line[:300])
+            self.stdout.write(line + "\n")
+            self.stdout.flush()
+        if self.debug:
+            self.log("OUT", line[:300])
 
     # ---- stream-json frames ----
+    def system(self, subtype, **fields):
+        self.emit({"type": "system", "subtype": subtype, **fields, "session_id": self.s.session_id,
+                   "uuid": str(uuid.uuid4())})
+
     def init_frame(self, t3_uuid):
         f = {"type": "system", "subtype": "init", "cwd": self.s.live["cwd"], "session_id": self.s.session_id,
              "tools": [], "mcp_servers": [], "model": self.model, "permissionMode": self.permission_mode,
@@ -93,17 +136,24 @@ class Bridge:
             f["user_message_uuids"] = [t3_uuid]   # early prompt echo: binds the frames to T3's own turn
         return f
 
-    def assistant(self, block, meta=None, uid=None):
+    def assistant(self, block, meta=None, uid=None, parent=None):
         meta = meta or {"id": "msg_bridge_" + uuid.uuid4().hex[:16], "type": "message", "role": "assistant",
                         "model": self.model, "stop_reason": None, "usage": {"input_tokens": 0, "output_tokens": 0}}
-        self.emit({"type": "assistant", "message": {**meta, "content": [block]}, "parent_tool_use_id": None,
+        self.emit({"type": "assistant", "message": {**meta, "content": [block]}, "parent_tool_use_id": parent,
                    "session_id": self.s.session_id, "uuid": uid or str(uuid.uuid4())})
+
+    def user(self, content, parent=None, uid=None, tool_use_result=None):
+        f = {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": parent,
+             "session_id": self.s.session_id, "uuid": uid or str(uuid.uuid4())}
+        if tool_use_result is not None:
+            f["tool_use_result"] = tool_use_result
+        self.emit(f)
 
     def text(self, text):
         self.assistant({"type": "text", "text": text})
 
     def open_turn(self, t3_uuid):
-        self.turn = {"t3_uuid": t3_uuid, "started": time.time(), "last_text": ""}
+        self.turn = {"t3_uuid": t3_uuid, "started": time.time(), "last_text": "", "landed": False}
         self.emit(self.init_frame(t3_uuid))
         for n in self.pending_notices:
             self.text(f"⚠ bridge: {n}")
@@ -122,6 +172,9 @@ class Bridge:
         if t["t3_uuid"]:
             r["user_message_uuids"] = [t["t3_uuid"]]
         self.emit(r)
+        if t["t3_uuid"] and not self.wakeable:
+            self.wakeable = True
+            self.flush_held()
 
     def notice(self, text):
         """Fail loudly: log, and show in the thread now, as a one-line turn, or at the next turn."""
@@ -129,7 +182,7 @@ class Bridge:
         with self.lock:
             if self.turn is not None:
                 self.text(f"⚠ bridge: {text}")
-            elif self.routable:
+            elif self.wakeable:
                 self.open_turn(None)
                 self.text(f"⚠ bridge: {text}")
                 self.close_turn()
@@ -138,60 +191,153 @@ class Bridge:
 
     # ---- core events -> T3 ----
     def on_event(self, ev):
-        k = ev["kind"]
         with self.lock:
+            k = ev["kind"]
             if k == "notice":
                 return self.notice(ev["text"])
             if k == "session":
-                self.log("session", ev)
+                self.log("session", ev["session_id"], "pane", ev["pane"])
                 if ev["switched"]:
                     self.notice(f"live session switched to {ev['session_id']} (/clear or restart); following it")
                 return
-            if k == "turn_start":
-                if self.turn is not None and self.turn["t3_uuid"] and not self.turn.get("landed"):
-                    self.turn["landed"] = True
-                    if not ev["by_us"]:   # a tmux/RC prompt raced T3's: both run inside T3's turn
-                        self.log("race: first prompt in T3's turn was not T3's:", ev["text"][:80])
-                    return
-                if self.turn is not None:
-                    self.close_turn()   # a new prompt ends whatever was open
-                self.open_turn(None)
-                label = {"human": "typed in tmux/RC", "peer": f"peer {ev.get('peer') or ''}".strip()}.get(
-                    ev["origin"], ev["origin"])
-                body = ev["text"] if len(ev["text"]) < 600 else ev["text"][:600] + "…"
-                return self.text(f"› ({label}) " + body.replace("\n", "\n› "))
-            if k == "turn_end":
-                if self.turn is not None:
-                    self.turn["last_text"] = ev["last_text"]
-                return self.close_turn(ev["reason"] == "interrupted")
+            if k == "send_failed":
+                return self.send_failed(ev)
+            if k in ("dialog_open", "dialog_closed"):
+                return self.dialog(ev)
+            if not self.wakeable and not (self.turn and self.turn["t3_uuid"]):
+                return self.hold(ev)   # T3 can't show an unsolicited turn yet
+            self.deliver(ev)
+
+    def hold(self, ev):
+        if len(self.held) < REPLAY_CAP:
+            self.held.append(ev)
+        else:
+            self.dropped += 1
+
+    def flush_held(self):
+        held, self.held = self.held, []
+        if held or self.dropped:
+            n = sum(e["kind"] == "turn_start" for e in held)
+            self.notice(f"{n} turn(s) ran while T3 was not attached; shown below"
+                        + (f" ({self.dropped} later events dropped: see the tmux pane)" if self.dropped else ""))
+            self.dropped = 0
+        for ev in held:
+            self.deliver(ev)
+        if self.turn is not None and not self.turn["t3_uuid"]:
+            self.close_turn()   # a held turn that is still running carries on as a wake turn
+
+    def deliver(self, ev):
+        k = ev["kind"]
+        parent = ev.get("parent_tool_use_id")
+        if k == "turn_start":
+            return self.turn_start(ev)
+        if k == "turn_end":
+            if self.turn is not None:
+                self.turn["last_text"] = ev["last_text"]
+                self.close_turn(ev["reason"] == "interrupted")
+            if (ev.get("offset") or 0) > self.offset:
+                self.offset = ev["offset"]
+                self.s.save_offset(self.offset)   # the transcript is delivered up to here
+            return
+        if k == "subagent_start":
+            return self.task_started(ev["id"], ev["tool_use_id"], ev["description"], ev["prompt"],
+                                     ev.get("agent_type"), ev["background"])
+        if self.turn is None and parent is None:
+            self.open_turn(None)   # output with no prompt seen: a wake turn
+        if k == "subagent_end":
+            return self.task_notification(ev)
+        if k in ("text", "thinking", "tool_use"):
+            return self.assistant(ev["block"], ev["message"], ev.get("uuid"), parent)
+        if k == "tool_result":
+            tur = ev.get("tool_use_result")
+            if isinstance(tur, dict) and tur.get("status") == "async_launched" and tur.get("agentId"):
+                self.task_started(tur["agentId"], ev["block"].get("tool_use_id"), tur.get("description", ""),
+                                  tur.get("prompt", ""), None, True)   # T3 wants task_started before this result
+            return self.user([ev["block"]], parent, ev.get("uuid"), tur)
+        self.notice(f"core event {k!r} not mapped")
+
+    def turn_start(self, ev):
+        if self.turn is not None and self.turn["t3_uuid"] and not self.turn["landed"]:
+            self.turn["landed"] = True
+            if not ev["by_us"]:   # a tmux/RC prompt raced T3's: both run inside T3's turn
+                self.log("race: first prompt in T3's turn was not T3's")
+            return
+        if self.turn is not None:
+            self.close_turn()   # a new prompt ends whatever was open
+        self.open_turn(None)
+        if ev["origin"] == "task-notification":
+            n = rolelive.task_notification(ev["text"])
+            return self.text(f"› (background task {n['status'] or 'finished'}: {n['summary'] or n['task-id']})")
+        label = "sent from T3" if ev["by_us"] else {
+            "human": "typed in tmux/RC", "peer": f"peer {ev.get('peer') or ''}".strip()}.get(ev["origin"], ev["origin"])
+        if ev.get("replay"):
+            label += ", earlier"
+        body = ev["text"] if len(ev["text"]) < 600 else ev["text"][:600] + "…"
+        self.text(f"› ({label}) " + body.replace("\n", "\n› "))
+
+    def task_started(self, aid, tool_use_id, description, prompt, agent_type, background):
+        if aid in self.announced:
+            return
+        self.announced.add(aid)
+        if background:
+            self.tasks[aid] = description
+            self.background_changed()
+        self.system("task_started", task_id=aid, tool_use_id=tool_use_id, description=description,
+                    task_type="local_agent", prompt=prompt, subagent_type=agent_type or "general-purpose",
+                    is_backgrounded=bool(background))
+        if not background:
+            self.user([{"type": "text", "text": prompt}], tool_use_id)   # the child's prompt, as the SDK sends it
+
+    def task_notification(self, ev):
+        if ev["id"] not in self.announced:   # the Agent call ended before T3 heard of it
+            self.task_started(ev["id"], ev["tool_use_id"], "", "", None, False)
+        self.system("task_notification", task_id=ev["id"], tool_use_id=ev["tool_use_id"], status=ev["status"],
+                    output_file="", summary=ev["summary"])
+        if self.tasks.pop(ev["id"], None) is not None:
+            self.background_changed()
+
+    def background_changed(self):
+        self.system("background_tasks_changed", tasks=[
+            {"task_id": k, "task_type": "local_agent", "description": v} for k, v in self.tasks.items()])
+
+    def send_failed(self, ev):
+        why = {"draft": "someone has text typed in the tmux pane", "dialog": "a dialog is open in the session",
+               "timeout": "it never showed up in the session", "tmux": "tmux refused the keys"}.get(ev["reason"],
+                                                                                                    ev["reason"])
+        self.notice(f"message not delivered ({why}); send it again: {ev['text'][:200]}")
+        if self.turn is not None and self.turn["t3_uuid"] and not self.turn["landed"]:
+            self.close_turn()
+
+    def dialog(self, ev):
+        if ev["kind"] == "dialog_open":
             if self.turn is None:
                 self.open_turn(None)
-            if k in ("text", "thinking", "tool_use"):
-                return self.assistant(ev["block"], ev["message"], ev.get("uuid"))
-            if k == "tool_result":
-                return self.emit({"type": "user", "message": {"role": "user", "content": [ev["block"]]},
-                                  "parent_tool_use_id": None, "session_id": self.s.session_id,
-                                  "uuid": ev.get("uuid"), "tool_use_result": ev.get("tool_use_result")})
-            if k == "dialog_open":
-                rid = str(uuid.uuid4())
-                self.requests[rid], self.by_dialog[ev["id"]] = ev["id"], rid
-                return self.emit({"type": "control_request", "request_id": rid, "request": {
-                    "subtype": "can_use_tool", "tool_name": ev["tool"], "display_name": ev["tool"],
-                    "input": ev["input"], "tool_use_id": ev["id"],
-                    "requires_user_interaction": ev["dialog"] == "question"}})
-            if k == "dialog_closed":
-                rid = self.by_dialog.pop(ev["id"], None)
-                if rid and ev["by"] == "elsewhere":   # answered in tmux or RC: close T3's dialog
-                    self.requests.pop(rid, None)
-                    self.emit({"type": "control_cancel_request", "request_id": rid})
-                return
-            self.notice(f"core event {k!r} not mapped")
+            rid = str(uuid.uuid4())
+            self.requests[rid], self.by_dialog[ev["id"]] = ev["id"], rid
+            return self.emit({"type": "control_request", "request_id": rid, "request": {
+                "subtype": "can_use_tool", "tool_name": ev["tool"], "display_name": ev["tool"],
+                "input": ev["input"], "tool_use_id": ev["id"],
+                "requires_user_interaction": ev["dialog"] == "question"}})
+        rid = self.by_dialog.pop(ev["id"], None)
+        if rid and ev["by"] == "elsewhere":   # answered in tmux or RC: close T3's dialog
+            self.requests.pop(rid, None)
+            self.emit({"type": "control_cancel_request", "request_id": rid})
 
     # ---- T3 -> core ----
     def reply(self, rid, response=None, error=None):
         r = {"subtype": "error", "request_id": rid, "error": error} if error else \
             {"subtype": "success", "request_id": rid, "response": response or {}}
         self.emit({"type": "control_response", "response": r})
+
+    def change(self, model=None, effort=None):
+        """Apply only what T3 changed during this process: T3 repeats its pick on every turn and at spawn."""
+        if model is not None and model != self.want["model"]:
+            self.want["model"] = model
+        elif effort is not None and effort != self.want["effort"]:
+            self.want["effort"] = effort
+        else:
+            return
+        threading.Thread(target=self.s.set_model, args=(model, effort), daemon=True).start()
 
     def on_control(self, msg):
         req, rid = msg.get("request", {}), msg.get("request_id")
@@ -207,14 +353,14 @@ class Bridge:
             self.log(f"known gap: T3 MCP servers {names} are not available in the live session")
             self.reply(rid, {"added": names, "removed": [], "errors": {}})
         elif st == "set_model":
-            self.s.set_model(req.get("model"))   # refused by the core with a notice (it would persist)
+            self.change(model=req.get("model"))   # session-only picker switch; refused with a notice when busy
             self.reply(rid)
         elif st == "apply_flag_settings":
             s = {k: v for k, v in req.get("settings", {}).items() if v is not None}
             if "effortLevel" in s:
-                self.s.set_effort(s.pop("effortLevel"))
+                self.change(effort=s.pop("effortLevel"))
             if s:
-                self.notice(f"settings not applied to the live session: {json.dumps(s)}")
+                self.notice(f"settings not applied to the live session: {', '.join(s)}")
             self.reply(rid)
         elif st == "set_permission_mode":
             if req.get("mode") != self.permission_mode:
@@ -231,13 +377,23 @@ class Bridge:
         resp = msg.get("response", {})
         did = self.requests.pop(resp.get("request_id"), None)
         if did is None:
-            return self.log("control_response for unknown request", resp.get("request_id"))
+            return self.log("control_response for unknown request")
         self.by_dialog.pop(did, None)
         body = resp.get("response") or {}
-        if resp.get("subtype") != "success" or body.get("behavior") != "allow":
-            return self.s.answer(did, "deny")
+        cls, behavior = body.get("decisionClassification"), body.get("behavior")
+        self.log("decision", did, resp.get("subtype"), behavior, cls)
         answers = (body.get("updatedInput") or {}).get("answers")
-        self.s.answer(did, answers if answers is not None else "allow")
+        if resp.get("subtype") == "success" and behavior == "allow" and answers is not None:
+            return self.s.answer(did, answers)   # a question: only a person can have picked these
+        if resp.get("subtype") == "success" and behavior == "allow" and cls in HUMAN_ALLOW:
+            if cls == "user_permanent":
+                self.notice("allowed once; 'always allow' is not applied to the live session")
+            return self.s.answer(did, "allow")
+        if resp.get("subtype") == "success" and behavior == "deny" and cls == "user_reject":
+            return self.s.answer(did, "deny")
+        # T3 decided without a person (its mode auto-approves, or it errored): never press keys for that.
+        self.notice(f"T3 answered the {did} dialog without a person deciding ({behavior or resp.get('subtype')}); "
+                    "it stays open in the tmux pane: answer it there, or switch the thread to approval-required")
 
     def on_user(self, msg):
         content, files = msg["message"]["content"], []
@@ -251,11 +407,11 @@ class Bridge:
                 elif b.get("type") in ("image", "document") and src.get("type") == "base64":
                     ext = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
                            "application/pdf": "pdf"}.get(src.get("media_type"), "bin")
-                    d = os.path.join(LOG_DIR, "attachments")
+                    d = os.path.join(self.dir, "attachments")
                     os.makedirs(d, mode=0o700, exist_ok=True)
                     p = os.path.join(d, f"{uuid.uuid4().hex}.{ext}")
-                    with open(p, "wb") as f:
-                        f.write(base64.b64decode(src["data"]))
+                    with private_file(p) as f:
+                        f.buffer.write(base64.b64decode(src["data"]))
                     files.append(p)
                 else:
                     self.notice(f"message part of type {b.get('type')!r} dropped")
@@ -266,22 +422,55 @@ class Bridge:
                 self.notice("T3 message sent while a turn was running; the live session queues it")
             else:
                 self.open_turn(msg.get("uuid") or str(uuid.uuid4()))
-        self.s.send(text, files)
+        threading.Thread(target=self.s.send, args=(text, files), daemon=True).start()   # may wait for a draft
+
+    # ---- deploys ----
+    def code_files(self):
+        return [os.path.realpath(__file__), os.path.realpath(rolelive.__file__)]
+
+    def busy(self):
+        return bool(self.turn or self.s.dialogs or self.s.sent or self.requests)
+
+    def watch_deploys(self):
+        """New code on disk: finish the open turn, then exit so T3 starts the new version on its next message."""
+        stamp = lambda: [os.stat(p).st_mtime_ns for p in self.code_files()]   # noqa: E731
+        first = stamp()
+        while True:
+            time.sleep(DEPLOY_POLL)
+            try:
+                changed = stamp() != first
+            except OSError:
+                changed = False   # mid-replace
+            with self.lock:
+                if changed and not self.busy():
+                    self.log("code changed on disk; exiting so T3 respawns the new version")
+                    return self.exit()
+
+    def exit(self):
+        with self.lock:
+            if self.tasks:
+                self.tasks.clear()
+                self.background_changed()   # release T3's background-work pin
+            self.logf.flush()
+            os._exit(0)
 
     def run(self):
-        start = (self.flags.get("--bridge-start") or [None])[0]
-        self.s = rolelive.LiveSession.attach(role=self.role, start_cmd=start)
+        start = self.flag("--bridge-start")
+        self.s = rolelive.LiveSession.attach(role=self.role, start_cmd=start, claude_dir=self.claude_dir,
+                                             tmux_session=self.flag("--bridge-tmux-session"))
         self.log("attached", self.role, self.s.session_id, "pane", self.s.pane, "pid", self.s.live["pid"])
         for a in self.unknown:
             self.notice(f"unknown argument {a!r} ignored")
         for k, v in self.flags.items():
-            (self.log if k in EXPECTED_FLAGS else self.notice)(f"flag {k} {v} not applied to the live session")
+            (self.log if k in EXPECTED_FLAGS else self.notice)(f"flag {k} not applied to the live session")
         self.s.on_event = self.on_event
-        self.s.start()
+        self.s.start(since="saved", state_key=f"t3-{self.role}")
+        threading.Thread(target=self.watch_deploys, daemon=True).start()
         for line in sys.stdin:
             if not line.strip():
                 continue
-            self.log("IN", line[:300].rstrip())
+            if self.debug:
+                self.log("IN", line[:300].rstrip())
             try:
                 msg = json.loads(line)
                 t = msg.get("type")
@@ -292,7 +481,7 @@ class Bridge:
                 elif t == "user":
                     self.on_user(msg)
                 elif t == "control_cancel_request":
-                    self.log("cancel", msg)
+                    self.log("cancel", msg.get("request_id"))
                 else:
                     self.notice(f"unknown input message type {t!r}")
             except Exception as e:   # a bridge bug must never hang T3
@@ -302,14 +491,15 @@ class Bridge:
                     self.reply(json.loads(line).get("request_id"), error=repr(e))
         self.log("stdin closed; detaching (the tmux session is untouched)")
         self.s.close()
-        os._exit(0)
+        self.exit()
 
 
 def main():
     argv = sys.argv[1:]
     flags, unknown = parse_argv(argv)
     if "--version" in argv or not ({"--session-id", "--resume"} & set(flags)):
-        os.execvp(REAL_CLAUDE, [REAL_CLAUDE] + strip_bridge_flags(argv))
+        claude = real_claude()
+        os.execvp(claude, [claude] + strip_bridge_flags(argv))
     Bridge(flags, unknown).run()
 
 
