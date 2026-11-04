@@ -43,12 +43,14 @@ The bridge logs to `<claude dir>/t3-bridge/bridge-<role>.log` (0700 dir, 0600 fi
 - `attach(role=None, session_id=None, start_cmd=None, claude_dir=None, tmux_session=None)`, then `start(since=None |
   "saved", state_key=None)` and `close()`. A missing role is started with `start_cmd` and `ROLELIVE_START=1` in its
   environment (no terminal); the start script must put the role in tmux. `save_offset(offset)` records what the consumer delivered.
-- `send(text, files=())`: waits up to 5 s for an empty input line, never types over a draft or into a dialog.
+- `send(text, files=())`: waits up to 5 s for an empty input line, never types over a draft or into a dialog, presses
+  Enter only when the box shows just its paste, and types only while the pane still runs the attached session under
+  the role's name (after a `/rename` away it refuses once and re-resolves the role).
 - `interrupt()`, `answer(id, choice)` (`{question: label}`, `"a, b"` for multiSelect, free text, `"allow"`, `"deny"`),
   `set_model(model=None, effort=None)`, `status()`.
 - Events (dicts with `kind`; names and fields are stable, the module docstring lists every field): `turn_start`,
   `text`, `thinking`, `tool_use`, `tool_result`, `turn_end`, `subagent_start`, `subagent_end`, `dialog_open`,
-  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`), `session`, `notice`.
+  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`, `session`), `session`, `notice`.
 - CLI: `rolelive.py ROLE [--start CMD] [--tmux-session NAME]` prints events as JSON lines. Each stdin line is input,
   or `:interrupt`, `:answer ID …`, `:allow ID`, `:deny ID`, `:model M [E]`, `:effort E`, `:status`.
 

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,12 +35,21 @@ def screen_file(name):
         return f.read()
 
 
+def write_session(claude_dir, d):
+    """sessions/<pid>.json as the CLI keeps it (pid must be alive)."""
+    os.makedirs(os.path.join(claude_dir, "sessions"), exist_ok=True)
+    with open(os.path.join(claude_dir, "sessions", f"{d['pid']}.json"), "w") as f:
+        json.dump(d, f)
+
+
 class Fake(rolelive.LiveSession):
     """A LiveSession whose pane is a string and whose key presses are recorded."""
 
     def __init__(self, claude_dir, screen=""):
         super().__init__(role="toy", claude_dir=claude_dir)
-        self.live = {"sessionId": "sid-1", "cwd": "/tmp/toy", "tmux": "test:@1.%1", "pid": 1, "status": "idle"}
+        self.live = {"sessionId": "sid-1", "cwd": "/tmp/toy", "tmux": "test:@1.%1", "pid": os.getpid(),
+                     "status": "idle", "name": "toy", "updatedAt": 1}
+        write_session(claude_dir, self.live)
         self.scr, self.keys, self.pasted, self.events = screen, [], [], []
         self.on_event = self.events.append
 
@@ -127,6 +137,85 @@ class Send(Base):
         self.s.sent = [["hello  there", time.time()]]
         self.s._entry(prompt("hello there"))
         self.assertTrue(self.s.events[-1]["by_us"])
+        self.assertEqual(self.s.sent, [])
+
+    def test_send_refused_after_a_rename_and_the_namesake_followed(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        write_session(self.dir, {**self.s.live, "name": "elsewhere"})   # /rename in the attached session
+        other = {**self.s.live, "sessionId": "sid-2", "tmux": "test:@2.%2", "pid": os.getppid(), "updatedAt": 2}
+        write_session(self.dir, other)   # another session already carries the name
+        self.assertFalse(self.s.send("hello"))
+        self.assertEqual(self.s.pasted, [])
+        self.assertEqual(self.s.sent, [])
+        self.assertEqual(self.s.events[-2:], [
+            {"kind": "session", "session_id": "sid-2", "pane": "%2", "switched": True},
+            {"kind": "send_failed", "text": "hello", "reason": "session"}])
+        self.assertTrue(self.s.send("hello"))   # re-resolved: the next send goes to the session now named so
+        self.assertEqual(self.s.pasted, ["hello"])
+
+    def test_send_refused_when_the_session_moved_to_another_pane(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        write_session(self.dir, {**self.s.live, "tmux": "test:@3.%3"})
+        self.assertFalse(self.s.send("hello"))
+        self.assertEqual(self.s.pasted, [])
+        self.assertEqual(self.s.pane, "%3")
+
+    def test_send_absorbed_mid_turn_is_ours_and_not_expired(self):
+        # Pasted while a turn runs: no user entry, a queue-operation plus a queued_command attachment instead.
+        self.s.sent = [["please also check the notes file", time.time() - 100]]
+        self.s._entry(prompt("go"))
+        self.s.dialogs["p1"] = {"dialog": "permission", "tool": "Bash", "input": {"command": "ls"}, "synthetic": True}
+        self.s.events.clear()
+        with open(os.path.join(DATA, "absorbed-mid-turn.jsonl")) as f:
+            for ln in f:
+                self.s._entry(json.loads(ln))
+        self.assertEqual(self.s.events, [{"kind": "turn_start", "origin": "human", "by_us": True, "peer": None,
+                                          "text": "please also check the  notes file"}])
+        self.assertEqual(self.s.sent, [])
+        self.assertIn("p1", self.s.dialogs)   # the CLI's turn goes on: no turn_end, no dialog closed
+        self.s.idle_since = time.time() - 100
+        self.s._expire_sends(time.time())
+        self.assertEqual(self.s.kinds(), ["turn_start"])
+
+
+class Paste(Base):
+    """The real _paste, with tmux stubbed: the pane shows `after` once the paste is in."""
+
+    def setUp(self):
+        super().setUp()
+        self.s._paste = types.MethodType(rolelive.LiveSession._paste, self.s)
+        self.s._tmux = self.tmux
+        self.s.scr = screen_file("screen-empty.txt")
+
+    def tmux(self, *args, data=None):
+        self.s.keys.append(args)
+        if args[0] == "paste-buffer":
+            self.s.scr = self.after
+        return True
+
+    def box(self, text):   # screen-empty.txt with text typed in its prompt box
+        head, sep, tail = screen_file("screen-empty.txt").rpartition("❯ ")
+        return head + sep + text + tail
+
+    def entered(self):
+        return ("send-keys", "-t", "%1", "Enter") in self.s.keys
+
+    def test_enter_when_the_box_shows_the_paste(self):
+        self.after = self.box("hello   there")
+        self.assertTrue(self.s.send("hello there"))
+        self.assertTrue(self.entered())
+
+    def test_long_paste_shown_as_a_placeholder_is_submitted(self):
+        self.after = self.box("[Pasted text #1 +29 lines]")
+        self.assertTrue(self.s.send("\n".join(f"line {i}" for i in range(30))))
+        self.assertTrue(self.entered())
+
+    def test_keystroke_merged_into_the_paste_is_not_submitted(self):
+        self.after = screen_file("screen-draft.txt")   # someone typed before Enter: the box is not just our text
+        self.assertFalse(self.s.send("hello"))
+        self.assertFalse(self.entered())
+        self.assertEqual(self.s.kinds(), ["notice", "send_failed"])
+        self.assertEqual(self.s.events[-1]["reason"], "draft")
         self.assertEqual(self.s.sent, [])
 
 

@@ -24,7 +24,8 @@ Events (dicts, key "kind"; names and fields are stable, front ends map them):
                  already read, else None: a permission dialog's tool_use may only be written once it is decided)
     dialog_closed id, by ("us" | "elsewhere")
     send_failed  text, reason ("draft": the pane's input line held someone's draft, "dialog": a dialog was open,
-                 "timeout": the text never showed up as a prompt, "tmux": tmux refused)
+                 "timeout": the text never showed up as a prompt, "tmux": tmux refused, "session": the pane no
+                 longer runs the attached session under its name; the core re-resolves the role before the next send)
     session      session_id, pane, switched (bool)   (attach, /clear or restart)
     notice       text   (anything the core did not understand: never dropped silently)
   Transcript events also carry parent_tool_use_id (None, or the Agent call a subagent's event belongs to), offset
@@ -50,6 +51,7 @@ EFFORTS = set(EFFORT_ORDER)
 SEND_TIMEOUT = 45          # seconds a sent text may stay unseen while the session is idle
 DRAFT_WAIT = 5             # seconds to wait for someone's draft in the pane to clear before refusing a send
 SGR = re.compile(r"\x1b\[[0-9;:]*m")
+PASTED = re.compile(r"(?:\[Pasted text #\d+[^\]]*\]\s*)+")   # how the box shows a long paste
 DIM = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)", re.S)   # placeholder and suggestion text is dim
 
 
@@ -251,13 +253,30 @@ class LiveSession:
         return r.stdout.decode(errors="replace") if r.returncode == 0 else ""
 
     def _paste(self, text, submit=True):
+        """True when pasted (and submitted), False when tmux refused, None when the box showed more than our paste
+        (someone typed in the meantime): then Enter is not pressed and the box is left as it is."""
         # Named buffer + bracketed paste (-p): newlines don't submit early and the user's paste buffer is untouched.
         ok = self._tmux("load-buffer", "-b", "rolelive", "-", data=text.encode())
         ok = ok and self._tmux("paste-buffer", "-d", "-p", "-b", "rolelive", "-t", self.pane)
         if ok and submit:
-            time.sleep(0.3)
+            if not self._box_is(text):
+                # Never cleared: the cursor position is unknown, so deleting could eat the other person's keys.
+                self.notice("someone typed into the input box while a message was pasted; not submitted, the box "
+                            f"holds both texts: {text[:200]}")
+                return None
             ok = self._tmux("send-keys", "-t", self.pane, "Enter")
         return ok
+
+    def _box_is(self, text):
+        """The prompt box shows exactly the pasted text (wrapping aside), or only the CLI's placeholder for a long
+        paste. Polled briefly: the paste takes a moment to reach the screen."""
+        want = re.sub(r"\s+", "", text)
+        for _ in range(4):
+            time.sleep(0.3)
+            box = input_line(self.screen(escapes=True))
+            if box is not None and (re.sub(r"\s+", "", box) == want or PASTED.fullmatch(box)):
+                return True
+        return False
 
     def _keys(self, *keys):
         for k in keys:
@@ -288,16 +307,29 @@ class LiveSession:
         if files:
             text = (text + "\n" if text else "") + " ".join("@" + p for p in files)
         reason = self._ready_to_type()
-        if reason is None:
+        if reason is None and not self._still_attached():
+            reason = "session"
+            with self.lock:
+                live = self._find()
+                if live:
+                    self._follow(live)
+        elif reason is None:
             with self.lock:
                 self.sent.append([text, time.time()])
-            if self._paste(text):
+            pasted = self._paste(text)
+            if pasted:
                 return True
             with self.lock:
                 self.sent = [s for s in self.sent if s[0] is not text]
-            reason = "tmux"
+            reason = "tmux" if pasted is False else "draft"
         self.emit({"kind": "send_failed", "text": text, "reason": reason})
         return False
+
+    def _still_attached(self):
+        """The attached session still runs in our pane under the expected name. A /rename away, /clear or a restart
+        hands the pane or the name to another session; _watch only follows that within a second."""
+        cur = find_session(self.claude_dir, session_id=self.session_id, tmux_session=self.tmux_session)
+        return bool(cur) and cur["tmux"] == self.live["tmux"] and (not self.role or cur.get("name") == self.role)
 
     def interrupt(self):
         self._keys("Escape")
@@ -550,6 +582,13 @@ class LiveSession:
                 self.notice(f"transcript system entry {st!r} not understood")
             return
         if et == "attachment":   # a background agent's result can arrive mid-turn as an attachment
+            a = e.get("attachment") or {}
+            # A prompt pasted while a turn runs is absorbed into that turn: no user entry, only this attachment.
+            # Emitted without _turn_start: the CLI's turn goes on, so no turn_end and its dialogs stay open.
+            if (a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind") in (None, "human")
+                    and self._ours(str(a.get("prompt") or ""))):
+                self.emit({"kind": "turn_start", "origin": "human", "text": a["prompt"], "by_us": True,
+                           "peer": None, **self._meta})
             for text in strings(e):
                 if "<task-notification>" in text:
                     self._task_notification(text)
@@ -573,18 +612,19 @@ class LiveSession:
             return   # skill bodies, local command output, /model echoes, ...
         kind = origin.get("kind") or e.get("turnOrigin") or "human"
         body = origin.get("body") or text
-        by_us = False
-        if kind == "human" and self.sent:
-            # Our pastes come back as typed prompts, in order. A tmux/RC prompt racing ours is told apart by text.
-            norm = lambda s: " ".join(s.split())
-            for i, (s, _) in enumerate(self.sent):
-                if norm(s)[:60] in norm(body):   # prefix: the CLI rewrites @file mentions and pasted images
-                    del self.sent[:i + 1]
-                    by_us = True
-                    break
-        self._turn_start(kind, body, by_us, origin.get("name"))
+        self._turn_start(kind, body, kind == "human" and self._ours(body), origin.get("name"))
         if "<task-notification>" in body:
             self._task_notification(body)
+
+    def _ours(self, body):
+        """Our pastes come back as typed prompts, in order. A tmux/RC prompt racing ours is told apart by text.
+        A match drops it (and any older lost send) from the pending sends."""
+        norm = lambda s: " ".join(s.split())
+        for i, (s, _) in enumerate(self.sent):
+            if norm(s)[:60] in norm(body):   # prefix: the CLI rewrites @file mentions and pasted images
+                del self.sent[:i + 1]
+                return True
+        return False
 
     def _task_notification(self, text):
         n = task_notification(text)
@@ -782,12 +822,7 @@ class LiveSession:
                 continue
             gone = False
             with self.lock:
-                switched = live["sessionId"] != self.live["sessionId"] or live["tmux"] != self.live["tmux"]
-                self.live = live
-                if switched:
-                    self._turn_end("done")
-                    self.emit({"kind": "session", "session_id": self.session_id, "pane": self.pane,
-                               "switched": True})
+                self._follow(live)
                 idle = live.get("status") == "idle" and self.turn is None
                 self.idle_since = (self.idle_since or time.time()) if idle else None
                 self._expire_sends(time.time())
@@ -795,6 +830,14 @@ class LiveSession:
                 if (self.turn is not None and live.get("status") == "idle" and not self.dialogs
                         and time.time() - self.last_line_at > 15):
                     self._turn_end("done")
+
+    def _follow(self, live):
+        """Attach to live (under the lock); another session or pane ends the open turn and is announced."""
+        switched = live["sessionId"] != self.live["sessionId"] or live["tmux"] != self.live["tmux"]
+        self.live = live
+        if switched:
+            self._turn_end("done")
+            self.emit({"kind": "session", "session_id": self.session_id, "pane": self.pane, "switched": True})
 
     def _expire_sends(self, now):
         """A sent text that never showed up as a prompt (lost keystrokes, a dialog ate it) is dropped from the queue
