@@ -46,13 +46,16 @@ alias claude-orch='AGENT_MAIL_NAME=project-manager claude --dangerously-load-dev
 Claude's variadic flags swallow a trailing prompt: put the prompt before `--mcp-config`, `--channels` and
 `--dangerously-load-development-channels`.
 
-Codex (only for an interactive Codex session you want an inbox in; Codex workers get the server injected per launch
-with `-c`, so `config.toml` is never edited). Codex filters the environment it hands to MCP servers, so the name goes
-into the registration:
+Codex: never register it in `config.toml` (`codex mcp add`): that file is shared with the daily digest cron, and one
+fixed `AGENT_MAIL_NAME` would let every Codex session claim the same inbox. Codex workers get the server injected per
+launch with `-c`. For an interactive Codex session you want an inbox in, do the same with an alias (Codex filters the
+environment it hands to MCP servers, so the name goes into the `-c` flags):
 
 ```
-codex mcp add agent-mail --env AGENT_MAIL_DIR=/repo/$USER/.agent-mail --env AGENT_MAIL_NAME=<name> \
-  -- /usr/bin/python3.11 <this checkout>/agent-mail/agent_mail.py serve
+alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" \
+  -c mcp_servers.agent-mail.args="[\"<this checkout>/agent-mail/agent_mail.py\",\"serve\"]" \
+  -c mcp_servers.agent-mail.env.AGENT_MAIL_DIR="/repo/$USER/.agent-mail" \
+  -c mcp_servers.agent-mail.env.AGENT_MAIL_NAME="<name>"'
 ```
 
 ## How it works
@@ -75,7 +78,10 @@ trust level as our Claude workers (`bypassPermissions`). Reason: workers need ne
 that blocks it makes them useless. Under the bypass flag MCP tool calls are allowed. `read-only` and
 `workspace-write` exist for the rare restricted worker (no network, writes only to the workspace); there agent-mail
 is auto-approved with `default_tools_approval_mode="approve"`, because `codex exec` otherwise denies every MCP call.
-The recorded mode is in the worker record and `list`.
+The recorded mode is in the worker record and `list`. A worker's server knows its own level (`AGENT_MAIL_SANDBOX`), so a
+restricted worker cannot start a looser one (and defaults to its own level). Not enforced: a restricted worker can still
+`send` to a worker that already exists. Sender names (`From <name>:`) are self-declared by whoever writes the mail
+file: advisory only, since everything shares one user and one mail dir.
 
 **The sandbox is not what keeps a worker off lab equipment; the brief is.** Follow the repo's AGENTS.md live-equipment
 rules in every brief: say which hosts, nodes and CLIs the worker must not touch, and when it must stop and ask.

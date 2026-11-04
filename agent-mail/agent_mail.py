@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
-SANDBOXES = ("full", "read-only", "workspace-write")
+SANDBOXES = ("full", "workspace-write", "read-only")  # loosest to tightest
 LIVE = ("starting", "running", "idle")
 INSTRUCTIONS = ("Message other agent sessions. send(to, text) messages a Codex worker (it runs a turn) or any named "
                 "inbox; codex_start launches a Codex worker; list shows workers; inbox reads your unread mail when "
@@ -164,15 +164,22 @@ def tool_send(to, text):
     return f"delivered to inbox {to}"
 
 
-def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox="full"):
+def own_sandbox():
+    """The sandbox this instance itself runs in: set by the runner for workers, absent (= full) for orchestrators."""
+    return os.environ.get("AGENT_MAIL_SANDBOX") or "full"
+
+
+def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
     check_name(name, "worker name")
     if not isinstance(prompt, str) or not prompt:
         raise MailError("prompt must be a non-empty string")
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise MailError(f"cwd must be an existing absolute directory, got {cwd!r}")
-    sandbox = sandbox or "full"
+    sandbox = sandbox or own_sandbox()  # default: no looser than the caller
     if sandbox not in SANDBOXES:
         raise MailError(f"sandbox must be one of {SANDBOXES}")
+    if SANDBOXES.index(sandbox) < SANDBOXES.index(own_sandbox()):  # SANDBOXES runs from loosest to tightest
+        raise MailError(f"a {own_sandbox()} worker cannot start a looser ({sandbox}) worker")
     for v, what in ((model, "model"), (effort, "effort")):
         if v is not None and not MODEL_RE.match(str(v)):
             raise MailError(f"invalid {what} {v!r}")
@@ -344,7 +351,7 @@ def codex_args(rec, tid, last, text):
               "-c", 'mcp_servers.agent-mail.default_tools_approval_mode="approve"']
         a += ["-c", "sandbox_mode=" + json.dumps(sb)] if tid else ["-s", sb]
     # Codex hands MCP servers a filtered env: CODEX_HOME/AGENT_MAIL_CODEX must be injected or a worker-spawned runner has no auth.
-    env = {"AGENT_MAIL_NAME": rec["name"], "AGENT_MAIL_DIR": root()}
+    env = {"AGENT_MAIL_NAME": rec["name"], "AGENT_MAIL_DIR": root(), "AGENT_MAIL_SANDBOX": sb}
     for k in ("CODEX_HOME", "AGENT_MAIL_CODEX"):
         if os.environ.get(k):
             env[k] = os.environ[k]

@@ -414,6 +414,16 @@ class RunnerTests(Base):
             self.assertIn('mcp_servers.agent-mail.default_tools_approval_mode="approve"', a)
         self.assertNotIn("-s", resume)
 
+    def test_restricted_worker_cannot_start_a_looser_worker(self):
+        os.environ["AGENT_MAIL_SANDBOX"] = "read-only"
+        for sb in ("full", "workspace-write"):
+            with self.assertRaises(am.MailError, msg=sb):
+                self.start_sync("w2", sandbox=sb)
+        self.start_sync("w3")  # default: inherits the caller's level
+        self.assertEqual(am.read_worker("w3")["sandbox"], "read-only")
+        cfg = am.codex_args(am.read_worker("w3"), None, "/l", "p")
+        self.assertIn('mcp_servers.agent-mail.env.AGENT_MAIL_SANDBOX="read-only"', cfg)
+
     def test_validation(self):
         for bad in ("../x", "a/b", "", ".hidden", "x" * 80):
             with self.assertRaises(am.MailError, msg=bad):
