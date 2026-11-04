@@ -258,10 +258,18 @@ class Server:
                     "params": {"content": msg.get("text", ""), "meta": meta}})
 
     def poll(self, interval):
+        """Claim and push one message at a time; a push that fails goes back to new/ for the next reader."""
         while not self.stop.is_set():
             try:
-                for m in claim_inbox(me()):
-                    self.push(m)
+                new = inbox_dir(me())
+                for path, m in claim(new, inbox_dir(me(), "cur")):
+                    try:
+                        self.push(m)
+                    except (OSError, ValueError):  # client gone (broken pipe, closed stdout)
+                        os.rename(path, os.path.join(new, os.path.basename(path)))
+                        return
+                    if self.stop.is_set():
+                        return
             except (MailError, OSError):
                 pass
             self.stop.wait(interval)
@@ -331,6 +339,8 @@ class Server:
                 if m.get("id") is not None:
                     self.reply(m["id"], error={"code": -32603, "message": f"internal error: {e}"})
         self.stop.set()
+        if self.poller:  # let an in-flight push finish (or go back to new/) before the process exits
+            self.poller.join(5)
 
 
 # ---------- runner ----------

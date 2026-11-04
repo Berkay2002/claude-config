@@ -242,6 +242,20 @@ class ServerTests(Base):
                 got.append(c.notes.get()["params"]["content"])
         self.assertEqual(sorted(got), sorted(f"m{i}" for i in range(12)))
 
+    def test_push_to_a_closed_client_puts_the_mail_back(self):
+        """A push that hits a broken pipe must not leave its message (or the rest of the batch) in cur/."""
+        class Broken:
+            def write(self, _):
+                raise BrokenPipeError
+
+            def flush(self):
+                pass
+        for i in range(3):
+            am.deliver(am.inbox_dir("orch"), "bob", "orch", f"m{i}")
+        am.Server(stdin=[], stdout=Broken()).poll(0.01)  # returns once the client is gone
+        self.assertEqual(am.count_files(am.inbox_dir("orch")), 3)
+        self.assertEqual(am.count_files(am.inbox_dir("orch", "cur")), 0)
+
     def test_claim_race_between_threads(self):
         for i in range(60):
             am.deliver(am.inbox_dir("orch"), "bob", "orch", f"m{i}")
