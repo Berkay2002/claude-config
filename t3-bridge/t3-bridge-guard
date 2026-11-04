@@ -1,0 +1,43 @@
+#!/bin/bash
+# Update guard for t3-tmux-bridge: when a new T3 Code runtime version appears, check that the protocol
+# details the bridge relies on are still there, and that the new server boots on a throwaway base dir.
+# Usage: t3-bridge-guard [--force]   (cron or on login; exit 0 = PASS or nothing new, 1 = FAIL)
+# shortcut: no live turn yet (needs a WS RPC client to create a project/thread and send one prompt); add it
+# when the bridge goes to production.
+set -u
+VERSIONS=${T3_VERSIONS:-$HOME/.t3/runtime/versions}
+STATE=${T3_BRIDGE_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/t3-bridge}
+PORT=${T3_GUARD_PORT:-3799}
+mkdir -p "$STATE"
+new=$(ls -1 "$VERSIONS" | sort -V | tail -1)
+[ -n "$new" ] || { echo "no T3 runtime under $VERSIONS"; exit 1; }
+if [ "${1:-}" != --force ] && [ "$(cat "$STATE/last-version" 2>/dev/null)" = "$new" ]; then exit 0; fi
+bin="$VERSIONS/$new/t3"
+report="$STATE/guard-$new.txt"
+fail=0
+{
+  echo "T3 $new, $(date -Is)"
+  # Strings the bridge depends on (spawn flags, control subtypes, frame fields, wake-turn notification).
+  for s in '--session-id' '--resume' '--input-format' '--permission-prompt-tool' '--include-partial-messages' \
+           initialize mcp_set_servers set_model apply_flag_settings set_permission_mode interrupt \
+           can_use_tool control_cancel_request requires_user_interaction user_message_uuids num_turns \
+           'Background activity updated' tool_use_result; do
+    if grep -qaF -- "$s" "$bin"; then echo "ok   $s"; else echo "MISS $s"; fail=1; fi
+  done
+  base=$(mktemp -d)
+  env -u CLAUDECODE -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_JOB_DIR "$bin" serve --port "$PORT" \
+      --base-dir "$base" --no-browser "$base" >"$base/serve.log" 2>&1 &
+  pid=$!
+  up=0
+  for _ in $(seq 30); do
+    curl -fs -o /dev/null "http://127.0.0.1:$PORT/" && { up=1; break; }
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  if [ $up = 1 ]; then echo "ok   server boots"; else echo "FAIL server did not answer on $PORT"; fail=1; fi
+  rm -rf "$base"
+  [ $fail = 0 ] && echo PASS || echo "FAIL: keep the bridge instance on the old runtime until fixed"
+} >"$report" 2>&1
+cat "$report"
+[ $fail = 0 ] && echo "$new" >"$STATE/last-version"
+exit $fail
