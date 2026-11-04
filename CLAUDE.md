@@ -45,7 +45,7 @@ the 5h % in a note each turn, writes `~/.claude/usage/limits.json`, and auto-res
   still misses, the slice is too big (split it) or the question needs judgement (give the scouts' findings to a
   `reviewer`), never an Opus or Sonnet scout. Opus@low is never the pick.
   Haiku@xhigh is slow (~57s to first token): use low/medium when I am waiting on a quick lookup.
-  Haiku is 5× cheaper below 100K context ($0.10/$0.50 vs $0.50/$2.50 per MTok above), so it auto-compacts at 100K
+  Haiku is 5× cheaper below 100K context ($0.10/$0.50 vs $0.50/$2.50 per MTok above), but it auto-compacts at 180K by choice: fewer compactions are worth the price step
   (Opus/Sonnet at 300K). Size the read before launching (file sizes, about 4 characters a token): up to ~60K tokens,
   one scout; two or three slices, fan the scouts out yourself; more than that, launch one `scout-lead` (sonnet@medium),
   which splits the read into ~60K slices, runs a Haiku scout per slice in parallel and returns one merged report, so
