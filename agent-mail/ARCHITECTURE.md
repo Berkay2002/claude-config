@@ -31,6 +31,12 @@ flowchart LR
         X <-->|"tools: send, inbox, list"| S2
     end
 
+    subgraph CH["CODEX_HOME (/repo/$USER/codex)"]
+        SL["sessions/…/rollout-*.jsonl<br/>(rate_limits, plan)"]
+    end
+    X -->|"session log"| SL
+    SL -->|"list → codex_usage"| S1
+
     S1 -->|"write queue, spawn runner"| WR
     R -->|"claim queue → taken"| WR
     R -->|"turn_end / error"| IB
@@ -43,6 +49,33 @@ flowchart LR
 - **`run <name>`**: the runner. It starts in its own session, so a Claude restart or `/mcp` reconnect never kills a
   turn. An `flock` makes sure only one runs per worker, and it exits when the queue is empty.
 - **Mail folder**: all state. If any process dies, the files still say what is queued, running and delivered.
+- **Codex quota**: `list` reads the last `rate_limits` from the newest Codex session log (ChatGPT plan, 5-hour and
+  weekly percent, reset times; a window that has reset since shows 0), so the orchestrator can route by it.
+
+## When an orchestrator picks a Codex worker
+
+**TL;DR:** Codex is the extra hand on a smaller plan: second opinions, images, and a parallel piece when its quota
+allows. The rules live in "Codex workers" in the shared `CLAUDE.md`; this is their shape.
+
+```mermaid
+flowchart TD
+    A[Piece of work] --> B{Image generation?}
+    B -->|yes| S1["Codex gpt-6.1-sol@medium"]
+    B -->|no| C{Second opinion:<br/>final review, or a fix failed once?}
+    C -->|yes| D["Opus reviewer<br/>+ Codex gpt-6.1-sol@high"]
+    C -->|no| E{Independent parallel piece<br/>and codex_usage allows?}
+    E -->|yes| S2["Codex gpt-6.1-sol@medium/high<br/>(one or two at a time)"]
+    E -->|no| F["Claude worker per the Claude ladders"]
+```
+
+| `codex_usage` | Effect |
+|---|---|
+| Weekly above 75% | One rung down, no parallel Codex pieces |
+| Weekly or 5-hour above 90% | No new Codex worker unless the user asks |
+| Weekly ≤ 60%, reset ≤ 2 days away, spare ≥ 28%/day | Boost +1 rung (sol@medium → sol@high), one extra parallel piece |
+| Missing (no Codex turn yet) | Normal budget, no boost |
+
+`gpt-6-astra` only when the user asks; `xhigh`, `max` and `ultra` only with their OK.
 
 ## One round trip
 
@@ -112,6 +145,7 @@ stateDiagram-v2
 | Dead runner | The owner's server (push thread, `list`, `inbox`) checks the runner pid and starts a new one. |
 | Full environment | Only the worker's owner spawns runners, so every turn gets the orchestrator's env (proxies, `UV_*`, `LOG_PATH`), never the filtered env Codex hands to MCP servers. While the owner is down, its workers' mail waits. |
 | Flag injection | The prompt goes after `--`; names allow only letters, digits, `_` and `-` (no dots: `x.rec` would collide with lock files). |
+| Retire races | `retire` holds the runner lock, deletes the record and folder, and keeps the lock files, so a runner that opened the lock before still shares it with the next one. `send` re-checks the record under the record lock: mail to a just-retired worker goes to the inbox of that name, never into a dead queue. A runner that finds no record exits without writing one. |
 | Restricted workers | `sandbox` defaults to `full` (bypass flag). A `read-only` or `workspace-write` worker can't start a looser one. |
 
 ## Mail folder layout
