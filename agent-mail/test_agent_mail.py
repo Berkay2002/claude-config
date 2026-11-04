@@ -25,6 +25,10 @@ FAKE = """#!/usr/bin/env python3.11
 import json, os, sys, time
 d = os.environ["FAKE_DIR"]
 a = sys.argv[1:]
+if a[:1] == ["delete"]:
+    with open(d + "/calls.jsonl", "a") as f:
+        f.write(json.dumps({"argv": a}) + "\\n")
+    sys.exit(4 if os.path.exists(d + "/deletefail") else 0)
 resume = a[1:2] == ["resume"]
 last, prompt = a[a.index("-o") + 1], a[-1]
 tid = a[-2] if resume else None
@@ -755,6 +759,20 @@ class RunnerTests(Base):
         self.assertEqual((u["five_hour_percent"], u["week_percent"]), (0.0, 12.5))
         self.assertIn("week_resets", u)
         self.assertEqual(u["plan"], "plus")
+
+    def test_retire_can_delete_the_codex_thread(self):
+        """delete_thread runs `codex delete --force -- <id>`; a failed delete is reported and the worker is still gone."""
+        self.idle_worker()
+        self.assertIn("thread thread-1 is deleted", am.tool_retire("w1", delete_thread=True))
+        self.assertEqual(self.calls()[-1]["argv"], ["delete", "--force", "--", "thread-1"])
+        self.idle_worker()
+        self.flag("deletefail")
+        self.assertIn("was NOT deleted (codex exit 4", am.tool_retire("w1", delete_thread=True))
+        self.assertIsNone(am.read_worker("w1"))
+        self.idle_worker()
+        n = len(self.calls())
+        self.assertIn("is kept", am.tool_retire("w1"))  # default: no delete call
+        self.assertEqual(len(self.calls()), n)
 
     def test_retire_over_stdio(self):
         """The tool is registered with a schema and answers errors as isError results."""

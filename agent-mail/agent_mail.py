@@ -245,7 +245,7 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
     return f"worker {name} starting in {cwd} (sandbox {sandbox}); thread id and results arrive as mail from {name}"
 
 
-def tool_retire(name, force=False):
+def tool_retire(name, force=False, delete_thread=False):
     """Delete a worker's record and folder (its empty lock files stay, reused by a new worker). Holding the runner lock means no turn is running (and none starts)."""
     check_name(name, "worker name")
     owner = me() or "unknown"
@@ -275,6 +275,15 @@ def tool_retire(name, force=False):
             os.unlink(wrec(name))  # the lock files stay: a runner holding an old handle must share the next one's lock
     tid = rec.get("thread_id")
     kept = f"thread {tid} is kept (`codex delete --force {tid}` removes it)" if tid else "thread id was never recorded"
+    if delete_thread and tid:  # after the state is gone: a failed delete only leaves the history, never a half worker
+        try:
+            p = subprocess.run([os.environ.get("AGENT_MAIL_CODEX") or "codex", "delete", "--force", "--", tid],
+                               cwd=rec.get("cwd") if os.path.isdir(rec.get("cwd") or "") else None,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+            kept = (f"thread {tid} is deleted" if p.returncode == 0 else
+                    f"thread {tid} was NOT deleted (codex exit {p.returncode}: {(p.stderr or p.stdout).strip()[:200]})")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            kept = f"thread {tid} was NOT deleted ({e})"
     return f"retired worker {name}" + (f" (discarded {pending} message(s))" if pending else "") + f". Its Codex {kept}."
 
 
@@ -335,8 +344,8 @@ TOOLS = {
                      "model": {"type": "string"}, "effort": {"type": "string"},
                      "sandbox": {"type": "string", "enum": list(SANDBOXES)}}, ["name", "cwd", "prompt"]),
     "retire": (tool_retire, "Remove a Codex worker's state (record, queue, logs) once it is finished. Only its "
-               "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept.",
-               {"name": {"type": "string"}, "force": {"type": "boolean"}}, ["name"]),
+               "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept unless delete_thread.",
+               {"name": {"type": "string"}, "force": {"type": "boolean"}, "delete_thread": {"type": "boolean"}}, ["name"]),
     "list": (tool_list, "List Codex workers, this inbox's unread count and Codex's 5-hour/weekly quota use.", {}, []),
     "inbox": (tool_inbox, "Claim and return this instance's unread mail.", {}, []),
 }

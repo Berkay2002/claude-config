@@ -10,38 +10,28 @@ push; Codex reads mail with `inbox`. Tools, environment and registration are in 
 **TL;DR:** three kinds of process, one mail folder.
 
 ```mermaid
-flowchart LR
-    subgraph Claude["Claude orchestrator (AGENT_MAIL_NAME=project-manager)"]
-        C[Claude Code]
-        S1["agent_mail.py serve<br/>(stdio MCP)"]
-        C <-->|"tools: send, codex_start, retire, list, inbox"| S1
-        S1 -.->|"notifications/claude/channel<br/>(push)"| C
+flowchart TB
+    subgraph Claude["Claude orchestrator"]
+        C["Claude Code"] <-->|"MCP tools"| S1["agent_mail.py serve"]
+        S1 -.->|"channel push"| C
     end
-
-    subgraph Mail["AGENT_MAIL_DIR (/repo/$USER/.agent-mail)"]
-        IB["inbox/&lt;name&gt;/new → cur"]
-        WR["workers/&lt;name&gt;.json<br/>workers/&lt;name&gt;/queue, taken, logs"]
-    end
-
     subgraph Worker["Codex worker &lt;name&gt;"]
-        R["agent_mail.py run &lt;name&gt;<br/>(detached runner, flock)"]
-        X["codex exec --json<br/>codex exec resume &lt;thread&gt;"]
-        S2["agent_mail.py serve<br/>(injected with -c per turn)"]
-        R -->|"one turn per batch"| X
-        X <-->|"tools: send, inbox, list"| S2
+        R["agent_mail.py run<br/>(detached runner)"] -->|"one turn per batch"| X["codex exec / resume"]
+        X <-->|"MCP tools"| S2["agent_mail.py serve<br/>(injected per turn)"]
     end
-
-    subgraph CH["CODEX_HOME (/repo/$USER/codex)"]
-        SL["sessions/…/rollout-*.jsonl<br/>(rate_limits, plan)"]
+    subgraph Mail["AGENT_MAIL_DIR"]
+        WR["workers/&lt;name&gt;<br/>record, queue, taken, logs"]
+        IB["inbox/&lt;name&gt;<br/>new → cur"]
     end
-    X -->|"session log"| SL
-    SL -->|"list → codex_usage"| S1
-
-    S1 -->|"write queue, spawn runner"| WR
+    SL[("CODEX_HOME sessions<br/>rate_limits, plan")]
+    S1 -->|"spawn runner"| R
+    S1 -->|"queue mail"| WR
+    S1 -->|"claim mail (1 s poll)"| IB
+    S1 -.->|"list: codex_usage"| SL
     R -->|"claim queue → taken"| WR
     R -->|"turn_end / error"| IB
-    S2 -->|"send (message)"| IB
-    S1 -->|"poll 1 s, claim"| IB
+    S2 -->|"send"| IB
+    X -->|"session log"| SL
 ```
 
 - **`serve`**: the MCP server, one per session. Claude talks to it over stdio. In a Codex turn it is injected with
@@ -166,6 +156,15 @@ $AGENT_MAIL_DIR/
 
 ## Limits
 
-`retire` keeps the Codex thread (`codex delete --force <id>` removes it) and the empty lock files, sender names are self-declared, the push
-needs an interactive Claude with the development-channel flag (a `--bg` orchestrator polls `inbox`), and Kiro has no
-MCP channel, so it is not covered.
+**TL;DR:** all by design or outside agent-mail's reach.
+
+- **Lock files stay after `retire`**: they keep a runner that opened the lock before the retire and the next runner on
+  one lock. Empty files.
+- **Sender names are self-declared**: every session runs as one user on one mail folder, so any signing key would be
+  readable by every process that could forge mail.
+- **Push needs an interactive Claude with `--dangerously-load-development-channels server:agent-mail`**; a `--bg`
+  orchestrator reads mail with `inbox`. Claude Code (2.1.318) loads a channel without that flag only for a plugin on
+  Anthropic's approved list or on the org's `allowedChannelPlugins` (managed settings, set by an org admin), so shipping
+  agent-mail as a plugin would not remove it.
+- **`retire` keeps the Codex thread** unless `delete_thread=true`.
+- **Kiro** has no MCP channel, so it is not covered.

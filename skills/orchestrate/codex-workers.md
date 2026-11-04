@@ -38,8 +38,8 @@ is its report; ask for the report format in the brief.
 
 ## 5. Retire
 When merged or abandoned: `retire(name)` removes the worker's agent-mail state (owner only). It refuses while a turn runs ("retry after its
-`turn_end`") or mail is undelivered (`force=true` discards it), and it keeps the Codex thread: its answer gives the id for
-`codex delete --force <id>` if you want it gone. The worktree is removed with the `tidy` skill.
+`turn_end`") or mail is undelivered (`force=true` discards it), and it keeps the Codex thread unless you pass `delete_thread=true`
+(keep it while the history may still matter for review). The worktree is removed with the `tidy` skill.
 
 ## Traps (all checked on the VDI, codex 0.166)
 - `codex exec resume` takes its flags before the thread id and rejects `-C`, `-s` and `--add-dir`; agent-mail handles
