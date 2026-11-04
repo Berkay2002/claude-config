@@ -13,13 +13,15 @@ Same rules as step 3 of SKILL.md (goal, files, test that proves it, report forma
 - Workers run **unsandboxed by default** (`--dangerously-bypass-approvals-and-sandbox`), like our Claude workers, because
   they need network for uv/Artifactory. So the brief, not the sandbox, keeps them off lab equipment: copy the
   AGENTS.md live-equipment rules into it (hosts/nodes/CLIs not to touch; stop and ask before anything that could).
+- Images: tell the worker to use its image generation tool and to copy the results into a folder named in the brief
+  (Codex saves them under `$CODEX_HOME/generated_images/<thread id>/`). Reference screenshots: give their paths.
 - Worktree: create it yourself (`git worktree add` under `<repo>/.claude/worktrees/<name>`, never a sibling folder) and
   pass it as `cwd`; Codex has no `EnterWorktree`.
 
 ## 2. Launch
-`codex_start(name="<repo>-<piece>", cwd="<worktree>", prompt="<brief or path to it>", effort="medium")`. Model/effort per
-the shared ladders (Codex models are not on them: pick what the user names, else leave `model` unset for the
-`config.toml` default). `sandbox` stays unset unless the user wants a restricted worker (`read-only`,
+`codex_start(name="<repo>-<piece>", cwd="<worktree>", prompt="<brief or path to it>", model="gpt-6.1-sol", effort="medium")`.
+Model, effort and when to use Codex at all: "Codex workers" in the shared CLAUDE.md. Always pass both, and check
+`list` → `codex_usage` (the Codex quota) before launching. `sandbox` stays unset unless the user wants a restricted worker (`read-only`,
 `workspace-write`). It returns at once. You then get mail from the worker: `message` (thread id), then `turn_end` or
 `error` after each turn. A `claude/channel` push shows as `← agent-mail: …`.
 

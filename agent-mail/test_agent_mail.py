@@ -736,6 +736,26 @@ class RunnerTests(Base):
             self.assertEqual(am._drain("w1", lk, None), "done")
         self.assertIsNone(am.read_worker("w1"))
 
+    def test_list_reports_codex_quota_from_the_newest_session_log(self):
+        """codex_usage reads the last rate_limits of the newest rollout; a window that already reset counts as 0."""
+        self.assertIsNone(json.loads(am.tool_list())["codex_usage"])  # no logs yet
+        day = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "11", "04")
+        os.makedirs(day)
+        later = int(time.time()) + 3600
+
+        def log(name, five, week, five_reset):
+            ev = {"type": "token_count", "rate_limits": {"primary": {"used_percent": five, "window_minutes": 300,
+                  "resets_at": five_reset}, "secondary": {"used_percent": week, "window_minutes": 10080,
+                  "resets_at": later}, "plan_type": "plus"}}
+            with open(os.path.join(day, name), "w") as f:
+                f.write(json.dumps({"type": "other"}) + "\n" + json.dumps(ev) + "\n")
+        log("rollout-2026-11-04T09-00-00-a.jsonl", 90.0, 80.0, later)
+        log("rollout-2026-11-04T10-00-00-b.jsonl", 40.0, 12.5, int(time.time()) - 60)
+        u = json.loads(am.tool_list())["codex_usage"]
+        self.assertEqual((u["five_hour_percent"], u["week_percent"]), (0.0, 12.5))
+        self.assertIn("week_resets", u)
+        self.assertEqual(u["plan"], "plus")
+
     def test_retire_over_stdio(self):
         """The tool is registered with a schema and answers errors as isError results."""
         c = self.client()

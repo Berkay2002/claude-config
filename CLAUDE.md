@@ -117,5 +117,28 @@ so a script can fan out one agent per file and cross-verify findings, keeping my
 Say "use a workflow" to run it." Workflow signals: the same step over many items, more agents than one conversation can track,
 results that need independent cross-checking, or an orchestration worth saving and rerunning.
 
+# Codex workers (GPT, through agent-mail)
+A Claude orchestrator can hand work to a Codex CLI worker (`orchestrate` skill, `codex-workers.md`). Codex runs on my
+ChatGPT plan, which has far less quota than my Claude plan, so Codex is the extra hand, not the default builder:
+- **Second opinion**: the final review before merge, or debugging after one failed fix, next to the Opus `reviewer`
+  (never instead of it). A different model family catches different mistakes.
+- **Images**: image generation (UI mockups, logos, illustrations) goes to a Codex worker; Claude has none.
+- **Parallel capacity**: an independent piece of a split, as a background worker, when the quota below allows it;
+  one or two Codex workers at a time.
+
+Model and effort, always passed to `codex_start` (never the `config.toml` default; the digest cron owns that file).
+`gpt-6.1-sol` is the default and far cheaper than `gpt-6-astra`. Ladder: `sol@medium` (well-specified work, images)
+→ `sol@high` (harder steps, reviews) → `sol@xhigh` only with my OK. `gpt-6-astra` only when I ask; `max` and `ultra`
+never without my OK. No Luna, Terra or older models: reading and mechanical edits stay with Haiku scouts.
+Routing line as for Claude workers, e.g. "→ codex gpt-6.1-sol@high: second-opinion review of …".
+
+Codex quota, the same idea as the Claude budget and boost above. agent-mail `list` returns `codex_usage`: plan,
+5-hour and weekly percent, reset times. It comes from the newest Codex session log, so it lags until a Codex turn ran;
+missing means a normal budget and no boost.
+- Weekly above 75%: drop one rung and start no parallel Codex pieces. Weekly or 5-hour above 90%: no new Codex worker
+  unless I ask.
+- Boost: weekly used ≤ 60%, reset ≤ 2 days away and spare ≥ 28%/day (spare = (100 − used%) ÷ days to reset): +1 rung
+  (sol@medium → sol@high), and Codex may take an extra parallel piece. A boost never goes past sol@high or to Astra.
+
 # Git
 - Never add `Co-Authored-By: Claude …` or `Claude-Session: …` trailers to commits, and no "Generated with Claude Code" line in PRs.

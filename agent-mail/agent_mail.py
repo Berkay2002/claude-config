@@ -7,6 +7,7 @@ AGENT_MAIL_CODEX (codex binary, default `codex` on PATH), CODEX_HOME (passed thr
 """
 import ctypes
 import fcntl
+import glob
 import json
 import os
 import re
@@ -288,7 +289,34 @@ def tool_list():
             recs.append({k: r.get(k) for k in ("name", "state", "thread_id", "cwd", "owner", "sandbox")}
                         | {"last": (r.get("last_message") or "").split("\n", 1)[0]})
     unread = count_files(inbox_dir(me())) if me() else None
-    return json.dumps({"workers": recs, "unread": unread})
+    return json.dumps({"workers": recs, "unread": unread, "codex_usage": codex_usage()})
+
+
+def codex_usage():
+    """Codex's own quota (ChatGPT plan) from the newest session log that records it, so an orchestrator can route by it.
+    None when unknown (no CODEX_HOME, no logs yet, or a log format this code doesn't know)."""
+    home = os.environ.get("CODEX_HOME")
+    logs = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")), reverse=True) if home else []
+    for path in logs[:5]:  # names sort by start time; the newest few are enough
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - 512 * 1024))
+                tail = f.read().decode(errors="replace")
+            hits = list(re.finditer(r'"rate_limits"\s*:\s*', tail))
+            lim, _ = json.JSONDecoder().raw_decode(tail, hits[-1].end())
+        except (OSError, ValueError, IndexError):
+            continue
+        out = {"plan": lim.get("plan_type"),
+               "as_of": datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat(timespec="seconds")}
+        for w in (lim.get("primary"), lim.get("secondary")):
+            if isinstance(w, dict) and w.get("window_minutes") in (300, 10080):
+                key = "five_hour" if w["window_minutes"] == 300 else "week"
+                past = isinstance(w.get("resets_at"), (int, float)) and w["resets_at"] < time.time()
+                out[key + "_percent"] = 0.0 if past else w.get("used_percent")  # the window reset since that log
+                if w.get("resets_at"):
+                    out[key + "_resets"] = datetime.fromtimestamp(w["resets_at"], timezone.utc).isoformat(timespec="seconds")
+        return out
+    return None
 
 
 def tool_inbox():
@@ -309,7 +337,7 @@ TOOLS = {
     "retire": (tool_retire, "Remove a Codex worker's state (record, queue, logs) once it is finished. Only its "
                "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept.",
                {"name": {"type": "string"}, "force": {"type": "boolean"}}, ["name"]),
-    "list": (tool_list, "List Codex workers and this inbox's unread count.", {}, []),
+    "list": (tool_list, "List Codex workers, this inbox's unread count and Codex's 5-hour/weekly quota use.", {}, []),
     "inbox": (tool_inbox, "Claim and return this instance's unread mail.", {}, []),
 }
 
