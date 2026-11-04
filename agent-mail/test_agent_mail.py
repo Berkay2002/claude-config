@@ -424,6 +424,14 @@ class RunnerTests(Base):
         cfg = am.codex_args(am.read_worker("w3"), None, "/l", "p")
         self.assertIn('mcp_servers.agent-mail.env.AGENT_MAIL_SANDBOX="read-only"', cfg)
 
+    def test_prompts_that_look_like_flags_or_subcommands_stay_prompts(self):
+        """`codex exec "-x"` prints help and `codex exec review` runs a review: positionals go after `--`."""
+        rec = {"name": "w1", "cwd": self.cwd, "owner": "orch"}
+        for tid in (None, "tid"):
+            a = am.codex_args(rec, tid, "/l", "--dangerously-bypass-approvals-and-sandbox")
+            self.assertEqual(a[a.index("--"):], ["--"] + ([tid] if tid else []) + [a[-1]])
+            self.assertEqual(a.count("--dangerously-bypass-approvals-and-sandbox"), 2)  # the flag itself + the prompt
+
     def test_validation(self):
         for bad in ("../x", "a/b", "", ".hidden", "x" * 80):
             with self.assertRaises(am.MailError, msg=bad):

@@ -363,7 +363,8 @@ def codex_args(rec, tid, last, text):
           "-c", "mcp_servers.agent-mail.args=" + json.dumps([os.path.abspath(__file__), "serve"])]
     for k, v in env.items():
         a += ["-c", f"mcp_servers.agent-mail.env.{k}={json.dumps(v)}"]
-    return a + ["-o", last] + ([tid] if tid else []) + [text]
+    # `--`: a prompt like "-x" or "review" would otherwise be parsed as a codex flag or subcommand
+    return a + ["-o", last, "--"] + ([tid] if tid else []) + [text]
 
 
 def format_turn(rec, tid, msgs):
