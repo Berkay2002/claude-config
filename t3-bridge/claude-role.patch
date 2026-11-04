@@ -1,0 +1,20 @@
+--- a/claude-role
++++ b/claude-role
+@@ -12,6 +12,17 @@
+   exit 2
+ fi
+ shift
++# T3 mirroring (t3-bridge): the bridge starts a missing role with ROLELIVE_START=1 and no terminal; run it in tmux.
++if [ -n "${ROLELIVE_START:-}" ]; then
++  unset ROLELIVE_START   # a tmux server started here would hand it to every window, this role's too
++  again=("$0"); [ "$new" = 1 ] && again+=(--new)
++  tmux has-session -t roles 2>/dev/null || tmux new-session -d -s roles -n shell
++  exec tmux new-window -d -t roles -n "$role" "$(printf '%q ' "${again[@]}" "$role" "$@")"
++fi
++# Record AskUserQuestion and permission dialogs for the bridge (the hook never decides them).
++if hook=$(command -v t3-bridge-hook); then
++  set -- --settings "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"AskUserQuestion\",\"hooks\":[{\"type\":\"command\",\"command\":\"$hook\"}]}],\"PermissionRequest\":[{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"$hook\"}]}]}}" "$@"
++fi
+ home=$(sed -n '1s/^# home: //p' "$ROLES/$role.md")
+ desc=$(sed -n '2s/^# //p' "$ROLES/$role.md")
+ cd "${home:?first line of $ROLES/$role.md must be '# home: <dir>'}"

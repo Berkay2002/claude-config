@@ -1,0 +1,110 @@
+#!/bin/bash
+# Update guard for t3-tmux-bridge: when a new T3 Code runtime version appears, check that the protocol details the
+# bridge relies on are still in it, then run one live Haiku turn through the bridge on a throwaway T3 server.
+# Usage: t3-bridge-guard [--force]   (cron; exit 0 = PASS or nothing new, 1 = FAIL)
+# Report: $STATE/guard-<version>.txt, plus a desktop notification when notify-send and a session bus are there.
+# Env (defaults in brackets):
+#   T3_VERSIONS [~/.t3/runtime/versions]  T3_BRIDGE_STATE [$XDG_STATE_HOME or ~/.local/state, /t3-bridge]
+#   T3_GUARD_PORT [3799]  T3_GUARD_TMUX [t3-bridge-guard]: tmux session for the toy role (a window "guard" in it)
+#   T3_GUARD_CLAUDE_DIR [$CLAUDE_CONFIG_DIR or ~/.claude]: the claude config dir of the toy (sessions, transcripts)
+#   T3_BRIDGE_CLAUDE [claude], T3_GUARD_NODE [node]
+set -u
+HERE=$(dirname "$0")                       # the bin folder with the t3-tmux-bridge and t3-bridge-hook links
+VERSIONS=${T3_VERSIONS:-$HOME/.t3/runtime/versions}
+STATE=${T3_BRIDGE_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/t3-bridge}
+PORT=${T3_GUARD_PORT:-3799}
+TMUXS=${T3_GUARD_TMUX:-t3-bridge-guard}
+CLAUDE_DIR=${T3_GUARD_CLAUDE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}
+CLAUDE=${T3_BRIDGE_CLAUDE:-claude}
+NODE=${T3_GUARD_NODE:-node}
+RPC=$(dirname "$(readlink -f "$0")")/t3rpc.mjs
+mkdir -p "$STATE"
+new=$(ls -1 "$VERSIONS" 2>/dev/null | sort -V | tail -1)
+[ -n "$new" ] || { echo "no T3 runtime under $VERSIONS"; exit 1; }
+if [ "${1:-}" != --force ] && [ "$(cat "$STATE/last-version" 2>/dev/null)" = "$new" ]; then exit 0; fi
+bin="$VERSIONS/$new/t3"
+report="$STATE/guard-$new.txt"
+role="t3-bridge-guard-$$"
+toy="$STATE/guard-toy"                     # fixed, so the folder-trust question comes only on the first run
+base=$(mktemp -d)
+made_session=0 pid=
+cleanup() {
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
+  tmux kill-window -t "$TMUXS:guard" 2>/dev/null
+  [ $made_session = 1 ] && tmux kill-session -t "$TMUXS" 2>/dev/null
+  rm -rf "$base" "$CLAUDE_DIR/projects/$(printf %s "$toy" | tr -c "a-zA-Z0-9" -)" "$CLAUDE_DIR/rolelive/t3-$role.json"
+  [ $fail = 0 ] && rm -f "$CLAUDE_DIR/t3-bridge/bridge-$role.log"   # kept on FAIL for the diagnosis
+}
+trap cleanup EXIT
+fail=0
+ok() { echo "ok   $*"; }
+bad() { echo "FAIL $*"; fail=1; }
+{
+  echo "T3 $new, $(date -Is)"
+  # Strings the bridge depends on: spawn flags, control subtypes, frame fields, task frames, decision classes.
+  for s in '--session-id' '--resume' '--input-format' '--include-partial-messages' initialize mcp_set_servers \
+           set_model apply_flag_settings set_permission_mode interrupt can_use_tool control_cancel_request \
+           requires_user_interaction user_message_uuids num_turns tool_use_result task_started task_notification \
+           background_tasks_changed decisionClassification user_temporary user_permanent user_reject \
+           'Background activity updated'; do
+    grep -qaF -- "$s" "$bin" && ok "$s" || bad "missing string $s"
+  done
+
+  # One live turn: a toy role (Haiku, default permissions) in tmux, mirrored by the bridge into a throwaway server.
+  mkdir -p "$toy" "$base/project" "$base/home" "$base/data/userdata"
+  hook="$HERE/t3-bridge-hook"
+  settings='{"hooks":{"PreToolUse":[{"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"'$hook'"}]}],"PermissionRequest":[{"matcher":"*","hooks":[{"type":"command","command":"'$hook'"}]}]}}'
+  if ! tmux has-session -t "$TMUXS" 2>/dev/null; then
+    tmux new-session -d -s "$TMUXS" -n shell -x 160 -y 50 && made_session=1
+  fi
+  tmux new-window -d -t "$TMUXS" -n guard -c "$toy" \
+    env -u CLAUDECODE -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_JOB_DIR "$CLAUDE" -n "$role" --model haiku \
+    --permission-mode default --settings "$settings"
+  for _ in $(seq 30); do   # first run in this folder: answer the folder-trust question for it (and only that)
+    scr=$(tmux capture-pane -p -t "$TMUXS:guard" 2>/dev/null)
+    if grep -q '❯ Yes, I trust this folder' <<<"$scr"; then
+      tmux send-keys -t "$TMUXS:guard" Enter
+    elif grep -q '❯ No, exit' <<<"$scr"; then
+      tmux send-keys -t "$TMUXS:guard" Down
+    elif grep -q '^❯' <<<"$scr"; then
+      break   # the prompt box
+    fi
+    sleep 1
+  done
+  cat >"$base/data/userdata/settings.json" <<EOF
+{"providerInstances":{"guard":{"driver":"claudeAgent","displayName":"bridge guard","config":{
+  "binaryPath":"$HERE/t3-tmux-bridge",
+  "launchArgs":"--bridge-role $role --bridge-tmux-session $TMUXS --bridge-claude-dir $CLAUDE_DIR --bridge-start true"}}}}
+EOF
+  env -u CLAUDECODE -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_JOB_DIR HOME="$base/home" \
+    "$bin" serve --port "$PORT" --base-dir "$base/data" --no-browser "$base/project" >"$base/serve.log" 2>&1 &
+  pid=$!
+  tok=
+  for _ in $(seq 60); do
+    tok=$(grep -so 'pair#token=[A-Za-z0-9]*' "$base/serve.log" | head -1 | cut -d= -f2)
+    [ -n "$tok" ] && curl -fs -o /dev/null "http://127.0.0.1:$PORT/" && break
+    sleep 1
+  done
+  if [ -z "$tok" ]; then
+    bad "server did not boot on port $PORT"
+  else
+    rpc() { "$NODE" "$RPC" --url "http://127.0.0.1:$PORT" --pair-url "$tok" --session-file "$base/rpc.session" "$@"; }
+    if out=$(rpc smoke --instance guard --model claude-haiku-4-5 --project-dir "$base/project" \
+               --prompt "Reply with exactly: guard ok" --expect "guard ok" --timeout 120 2>&1); then
+      ok "server boots; live turn through the bridge: $out"
+    else
+      bad "live turn through the bridge: $out"
+      thread=$(grep -o '"threadId":"[^"]*' <<<"$out" | cut -d'"' -f4)
+      [ -n "$thread" ] && rpc items --thread "$thread" 2>&1 | grep -E '"(error|system_notice)"' | cut -c1-600
+      echo "--- toy pane"; tmux capture-pane -p -t "$TMUXS:guard" 2>&1 | grep -v '^$' | tail -8
+      echo "--- server log"; tail -5 "$base/serve.log"
+    fi
+  fi
+  [ $fail = 0 ] && echo PASS || echo "FAIL: keep the bridge instance on the old runtime until fixed"
+} >"$report" 2>&1
+cat "$report"
+[ $fail = 0 ] && echo "$new" >"$STATE/last-version"
+if command -v notify-send >/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  notify-send "T3 bridge guard: $( [ $fail = 0 ] && echo PASS || echo FAIL ) on $new" "$report" 2>/dev/null
+fi
+exit $fail
