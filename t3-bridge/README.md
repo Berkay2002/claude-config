@@ -79,4 +79,6 @@ claude or T3) and `node --test t3rpc.test.mjs`.
   session has been idle for 45 s.
 - Hook spool files in `$XDG_RUNTIME_DIR/t3-bridge/` hold each dialog's full tool input and are not cleaned up
   (they go with the runtime dir at logout).
+- After a model or effort switch the core puts `settings.json` back as it was before; a change another session wrote
+  in those 2-3 s is lost too.
 - A question is answered from T3 only while the dialog box on screen shows its first question and first option.

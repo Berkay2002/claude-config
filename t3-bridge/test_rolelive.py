@@ -187,7 +187,7 @@ class Dialogs(Base):
               {"question": "Pick toppings", "multiSelect": True,
                "options": [{"label": "Cheese"}, {"label": "Ham"}, {"label": "Olives"}]}]
         self.open("q1", "AskUserQuestion", {"questions": qs}, synthetic=False)
-        self.s.scr = "Pick a colour\n❯ 1. Red\nReview your answers"
+        self.s.scr = "Pick a colour\n❯ 1. Red\n  2. Green\n  3. Blue\n  4. Type something.\nReview your answers"
         self.s.answer("q1", {"Pick a colour": "Blue", "Pick toppings": "Cheese, Olives"})
         self.assertEqual(self.s.keys, ["3", "1", "3", "Tab", "Enter"])
 
@@ -206,6 +206,13 @@ class Dialogs(Base):
         self.open("q1", "AskUserQuestion", {"questions": self.FRUIT}, synthetic=False)
         self.s.scr = "● Pick a fruit for the test\n  ⎿ Apple\n" + PERMISSION_SCREEN.format(cmd="rm -rf build")
         self.assertFalse(self.s.answer("q1", {"Pick a fruit for the test": "Apple"}))
+        self.assertEqual(self.s.keys, [])
+
+    def test_yes_no_question_does_not_match_a_permission_dialog(self):
+        self.open("q1", "AskUserQuestion", {"questions": [
+            {"question": "Do you want to proceed?", "options": [{"label": "Yes"}, {"label": "No"}]}]}, synthetic=False)
+        self.s.scr = PERMISSION_SCREEN.format(cmd="rm -rf build")
+        self.assertFalse(self.s.answer("q1", "Yes"))
         self.assertEqual(self.s.keys, [])
 
     def test_synthetic_dialog_binds_to_its_tool_use_and_closes_on_the_result(self):

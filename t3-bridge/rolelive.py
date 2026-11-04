@@ -403,7 +403,9 @@ class LiveSession:
             top = max([i for i, ln in enumerate(lines[:rows[-1]]) if ln.lstrip().startswith("─")], default=-1)
             region = re.sub(r"\s+", "", "".join(lines[top + 1:rows[-1]]))
             text = re.sub(r"\s+", "", str(q.get("question", "")))
-            return scr if text and text in region and row == first else None
+            n = len(q.get("options") or []) + 1   # a question box ends its options with "N+1. Type something"
+            typed = any(re.match(rf"\s*(?:❯\s*)?{n}\. (?:\[.\] )?Type something", ln) for ln in lines[rows[-1]:])
+            return scr if text and text in region and row == first and typed else None
         yes = [i for i, ln in enumerate(lines) if re.match(r"\s*❯ 1\. Yes", ln)]
         if not yes:
             return None
