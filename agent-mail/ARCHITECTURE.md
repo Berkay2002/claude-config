@@ -67,7 +67,7 @@ flowchart TD
 | Same, above 40%/day (more than one full 5-hour window a day) | Up to four Codex workers |
 | Work waiting and weekly above 90%, or 5-hour full and weekly above 50%, or a reset expires within 24 h and weekly above 40% | Suggest spending a banked reset (earliest expiry first); only the user spends it |
 
-One full 5-hour window is roughly 40% of a week (the user's estimate: a couple of windows fill it), so the 5-hour
+One full 5-hour window is roughly 40% of a week (a couple of windows fill it), so the 5-hour
 limit caps how fast Codex can use quota and the weekly one how much. A banked reset that expires before the weekly
 reset is only worth something if the week is used up first: `use_before_lapse_percent_per_day` is that pace.
 
@@ -110,7 +110,7 @@ sequenceDiagram
     S-->>C: channel push ← agent-mail: SEVEN
 ```
 
-This is the exact sequence the end-to-end test ran on the VDI.
+This is the exact sequence of the end-to-end test against a real Codex.
 
 ## Worker states
 

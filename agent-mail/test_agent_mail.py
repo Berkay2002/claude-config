@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-"""agent_mail.py with a fake codex and temp dirs. Run: /usr/bin/python3.11 -B -m unittest -v test_agent_mail
+"""agent_mail.py with a fake codex and temp dirs. Run: python3.11 -B -m unittest -v test_agent_mail
 
 HOME, the mail dir, the codex binary and the MCP clients are all fakes in a temp dir: nothing reaches the real
 codex, mail dir, CODEX_HOME or any MCP config.

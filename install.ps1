@@ -50,16 +50,22 @@ Get-ChildItem (Join-Path $shared 'skills') -Directory | ForEach-Object { Link $_
 # Codex reads its global rules from $CODEX_HOME\AGENTS.md. A file symlink needs admin or Developer Mode, so this is a copy,
 # refreshed on each run; a symlink you made yourself is left alone. Only where Codex is set up; a failure only warns.
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-$codexRules = Join-Path $codexHome 'AGENTS.md'
+# The shared rules, and this machine's notes from the gitignored local\AGENTS.md when it exists.
+$codexCopies = @(@((Join-Path $shared 'codex\AGENTS.md'), (Join-Path $codexHome 'AGENTS.md')),
+                 @((Join-Path $shared 'local\AGENTS.md'), (Join-Path $codexHome 'AGENTS.local.md')))
 if (Test-Path $codexHome -PathType Container) {
-  try {
-    $item = Get-Item $codexRules -ErrorAction SilentlyContinue
-    $src = Read-Utf8 (Join-Path $shared 'codex\AGENTS.md')
-    if (-not ($item -and $item.LinkType) -and -not ($item -and (Read-Utf8 $codexRules) -ceq $src)) {
-      if ($item) { Copy-Item $codexRules (Join-Path $backups "codex-AGENTS.md.$stamp") }
-      Write-Utf8 "$codexRules.tmp" $src; Move-Item -Force "$codexRules.tmp" $codexRules
-    }
-  } catch { Write-Warning "Codex rules not copied to ${codexRules}: $($_.Exception.Message)" }
+  foreach ($pair in $codexCopies) {
+    $from, $to = $pair
+    if (-not (Test-Path $from -PathType Leaf)) { continue }
+    try {
+      $item = Get-Item $to -ErrorAction SilentlyContinue
+      $src = Read-Utf8 $from
+      if (-not ($item -and $item.LinkType) -and -not ($item -and (Read-Utf8 $to) -ceq $src)) {
+        if ($item) { Copy-Item $to (Join-Path $backups "codex-$($item.Name).$stamp") }
+        Write-Utf8 "$to.tmp" $src; Move-Item -Force "$to.tmp" $to
+      }
+    } catch { Write-Warning "Codex rules not copied to ${to}: $($_.Exception.Message)" }
+  }
 }
 
 # 3. Plugins: register and update marketplaces, then install missing user-scope plugins named in settings.shared.json. Failures go to stderr and keep the marker back.

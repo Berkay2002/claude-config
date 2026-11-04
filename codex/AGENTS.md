@@ -14,9 +14,13 @@ OpenAI or any model in commit messages, no "written by AI" notes in code, docs o
 - Worktrees only under `<repo>/.claude/worktrees/<name>`: never sibling folders next to a repo, never checkouts in
   `/tmp`. Never edit a tracked `.gitignore` for personal ignores; use `.git/info/exclude`.
 
+## Machine notes
+If `$CODEX_HOME/AGENTS.local.md` exists, read it before you start: it holds this machine's notes (paths,
+toolchains, what not to touch), linked from the gitignored `local/AGENTS.md` of claude-config.
+
 ## Disk
-Where home is a size-limited network share (the Ericsson VDI: `/home/$USER`), keep work folders, caches and scratch
-data on local disk under `/repo/$USER`.
+Where home is a size-limited network share, keep work folders, caches and scratch data on local disk (the brief or the
+repo's rules say where).
 
 ## As a worker
 When another session started you (an orchestrator, through agent-mail):

@@ -22,12 +22,11 @@ success. Names (workers and inboxes) are letters, digits, `_` and `-`.
 
 ## Environment (nothing defaults to `~`)
 
-- `AGENT_MAIL_DIR`: absolute mail root, **on local disk** (on the VDI: a folder under `/repo/$USER/`, never `/home`, which
-  is a size-limited NFS share). Missing: every tool returns a clear error and nothing is created.
+- `AGENT_MAIL_DIR`: absolute mail root, **on local disk**, never on a network-shared home. Missing: every tool returns a clear error and nothing is created.
 - `AGENT_MAIL_NAME`: who this instance is. Without it `send` still works (from `unknown`) but there is no inbox,
   no push and no `claude/channel` capability. An invalid name makes every tool fail.
 - `AGENT_MAIL_CODEX`: the codex binary (default `codex` on PATH). `CODEX_HOME`: passed through to every worker turn
-  (on the VDI the real one is the folder `/repo/$USER/codex`; a stray `.codex` has no auth).
+  (set it explicitly: a Claude and a shell with different `HOME`s would otherwise find different Codex homes).
 - `AGENT_MAIL_POLL`: inbox poll seconds (default 1).
 
 ## Register (once, by hand)
@@ -36,29 +35,29 @@ Claude Code, user scope. The name is not in the registration: it comes from the 
 have its own.
 
 ```
-claude mcp add --scope user agent-mail -e AGENT_MAIL_DIR=/repo/$USER/.agent-mail -e CODEX_HOME=/repo/$USER/codex \
-  -- /usr/bin/python3.11 <this checkout>/agent-mail/agent_mail.py serve
+claude mcp add --scope user agent-mail -e AGENT_MAIL_DIR=<local disk>/.agent-mail -e CODEX_HOME=<your CODEX_HOME> \
+  -- python3.11 <this checkout>/agent-mail/agent_mail.py serve
 ```
 
 Orchestrator launch (push needs the development-channel flag and a startup confirmation; `--bg` sessions drop it, so
 a background Claude reads mail with `inbox` instead):
 
 ```
-alias claude-orch='AGENT_MAIL_NAME=project-manager claude --dangerously-load-development-channels server:agent-mail'
+alias claude-orch='AGENT_MAIL_NAME=<your name> claude --dangerously-load-development-channels server:agent-mail'
 ```
 
 Claude's variadic flags swallow a trailing prompt: put the prompt before `--mcp-config`, `--channels` and
 `--dangerously-load-development-channels`.
 
-Codex: never register it in `config.toml` (`codex mcp add`): that file is shared with the daily digest cron, and one
+Codex: never register it in `config.toml` (`codex mcp add`): that file is shared by every Codex session and job, and one
 fixed `AGENT_MAIL_NAME` would let every Codex session claim the same inbox. Codex workers get the server injected per
 launch with `-c`. For an interactive Codex session you want an inbox in, do the same with an alias (Codex filters the
 environment it hands to MCP servers, so the name goes into the `-c` flags):
 
 ```
-alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" \
+alias codex-mail='codex -c mcp_servers.agent-mail.command="python3.11" \
   -c mcp_servers.agent-mail.args="[\"<this checkout>/agent-mail/agent_mail.py\",\"serve\"]" \
-  -c mcp_servers.agent-mail.env.AGENT_MAIL_DIR="/repo/$USER/.agent-mail" \
+  -c mcp_servers.agent-mail.env.AGENT_MAIL_DIR="<local disk>/.agent-mail" \
   -c mcp_servers.agent-mail.env.AGENT_MAIL_NAME="<name>"'
 ```
 
@@ -85,7 +84,7 @@ alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" 
 ## Permissions: workers run unsandboxed by default
 
 `codex_start` defaults to `sandbox: full`, i.e. `--dangerously-bypass-approvals-and-sandbox` on every turn, the same
-trust level as our Claude workers (`bypassPermissions`). Reason: workers need network (uv, Artifactory) and a sandbox
+trust level as our Claude workers (`bypassPermissions`). Reason: workers need network (package installs) and a sandbox
 that blocks it makes them useless. Under the bypass flag MCP tool calls are allowed. `read-only` and
 `workspace-write` exist for the rare restricted worker (no network, writes only to the workspace); there agent-mail
 is auto-approved with `default_tools_approval_mode="approve"`, because `codex exec` otherwise denies every MCP call.
@@ -94,13 +93,13 @@ restricted worker cannot start a looser one (and defaults to its own level). Not
 `send` to a worker that already exists. Sender names (`From <name>:`) are self-declared by whoever writes the mail
 file: advisory only, since everything shares one user and one mail dir.
 
-**The sandbox is not what keeps a worker off lab equipment; the brief is.** Follow the repo's AGENTS.md live-equipment
-rules in every brief: say which hosts, nodes and CLIs the worker must not touch, and when it must stop and ask.
+**The sandbox is not what keeps a worker off live systems; the brief is.** Copy the repo's own rules about live
+services, shared data and hardware into every brief: say what the worker must not touch, and when it must stop and ask.
 
 ## Tests
 
 ```
-cd agent-mail && /usr/bin/python3.11 -B -m unittest -v test_agent_mail
+cd agent-mail && python3.11 -B -m unittest -v test_agent_mail
 ```
 
 A fake `codex`, a temp mail dir and temp HOME; nothing reaches the real codex, mail dir or MCP configs.

@@ -40,8 +40,12 @@ The installer:
 Re-running it is safe.
 
 ## Make it yours
-- Notes about one machine (drives, toolchains, servers, where repos live) go in that machine's `~/.claude/CLAUDE.md`,
-  below the import line. They are not synced.
+- Notes about one machine (drives, toolchains, servers, where repos live, your plans) go in `local/` of this clone,
+  which is gitignored by design, so a pull never touches them and they are never pushed:
+  - `local/CLAUDE.md` is imported at the end of the shared rules when it exists.
+  - `local/AGENTS.md` is linked (copied on Windows) to `$CODEX_HOME/AGENTS.local.md`, which the shared Codex rules
+    tell Codex to read.
+  Your own `~/.claude/CLAUDE.md` below the import line works too and is not synced either.
 - Rules for one project go in that project's own `CLAUDE.md`.
 - To change the shared rules, fork this repo, edit, push, and install from your fork.
   Shared settings you don't want (theme, output style, plugins) can be removed from `settings.shared.json` in your fork.

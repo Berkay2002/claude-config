@@ -582,7 +582,7 @@ def backup(conf, path):
 # ---------- Remote Control offline rows ----------
 
 def api(method, path):
-    # IPv6 to api.anthropic.com stalls ~20s per request on the VDI; try IPv4 first.
+    # IPv6 to api.anthropic.com stalls ~20s per request on some networks; try IPv4 first.
     gai = socket.getaddrinfo
     socket.getaddrinfo = lambda *a, **k: sorted(gai(*a, **k), key=lambda r: r[0] != socket.AF_INET)
     try:

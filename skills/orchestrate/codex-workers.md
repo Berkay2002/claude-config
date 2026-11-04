@@ -11,8 +11,9 @@ Same rules as step 3 of SKILL.md (goal, files, test that proves it, report forma
   `turn_end`. To talk mid-turn it can call agent-mail's `send` tool (its name is its worker name). Mail between
   workers runs only while you (their owner) are up: your agent-mail instance starts every runner.
 - Workers run **unsandboxed by default** (`--dangerously-bypass-approvals-and-sandbox`), like our Claude workers, because
-  they need network for uv/Artifactory. So the brief, not the sandbox, keeps them off lab equipment: copy the
-  AGENTS.md live-equipment rules into it (hosts/nodes/CLIs not to touch; stop and ask before anything that could).
+  they need network for package installs. So the brief, not the sandbox, keeps them off live systems: copy the
+  repo's rules about live services, shared data and hardware into it (what not to touch; stop and ask before anything
+  that could).
 - Images: tell the worker to use its image generation tool and to copy the results into a folder named in the brief
   (Codex saves them under `$CODEX_HOME/generated_images/<thread id>/`). Reference screenshots: give their paths.
 - Worktree: create it yourself (`git worktree add` under `<repo>/.claude/worktrees/<name>`, never a sibling folder) and
@@ -41,14 +42,14 @@ When merged or abandoned: `retire(name)` removes the worker's agent-mail state (
 `turn_end`") or mail is undelivered (`force=true` discards it), and it keeps the Codex thread unless you pass `delete_thread=true`
 (keep it while the history may still matter for review). The worktree is removed with the `tidy` skill.
 
-## Traps (all checked on the VDI, codex 0.166)
+## Traps (checked with codex 0.166)
 - `codex exec resume` takes its flags before the thread id and rejects `-C`, `-s` and `--add-dir`; agent-mail handles
   this (cwd via the process, sandbox via `-c sandbox_mode=…`). `codex queue` is unreliable: never use it.
 - `codex exec` denies MCP tool calls ("approval policy is never") under a restricted sandbox unless
   `mcp_servers.<n>.default_tools_approval_mode="approve"` is set; under the bypass flag they run.
 - Codex gives MCP servers a filtered environment: `CODEX_HOME` and `AGENT_MAIL_*` must be injected (agent-mail does).
-- This VDI's `python3` is 3.6: use `/usr/bin/python3.11`. Claude runs with `HOME=/repo/<user>`, the shell and Codex with
-  `HOME=/home/<user>`: never default a path to `~`. The real `CODEX_HOME` is the folder `/repo/<user>/codex`; `.codex`
-  there is a stray home without auth. Keep `AGENT_MAIL_DIR` on local disk (`/repo/<user>/…`), never under `/home` (NFS, size-limited).
-- Never edit Codex's `config.toml` for a worker: the same `CODEX_HOME` runs the user's daily digest cron.
+- agent-mail needs Python 3.11+: register it with that interpreter where `python3` is older. Never default a path to
+  `~`: Claude and a shell can run with different `HOME`s, so pass `CODEX_HOME` and `AGENT_MAIL_DIR` explicitly, and keep
+  the mail dir on local disk, never on a network-shared home.
+- Never edit Codex's `config.toml` for a worker: every Codex session and job with that `CODEX_HOME` shares it.
 - Meta keys in channel notifications must be plain identifiers; Claude's variadic flags swallow a trailing prompt.

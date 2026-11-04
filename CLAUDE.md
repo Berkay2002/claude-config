@@ -118,15 +118,15 @@ Say "use a workflow" to run it." Workflow signals: the same step over many items
 results that need independent cross-checking, or an orchestration worth saving and rerunning.
 
 # Codex workers (GPT, through agent-mail)
-A Claude orchestrator can hand work to a Codex CLI worker (`orchestrate` skill, `codex-workers.md`). Codex runs on my
-ChatGPT plan, which has far less quota than my Claude plan, so Codex is the extra hand, not the default builder:
+A Claude orchestrator can hand work to a Codex CLI worker (`orchestrate` skill, `codex-workers.md`). Codex runs on a
+separate ChatGPT plan, usually with less quota than the Claude one, so Codex is the extra hand, not the default builder:
 - **Second opinion**: the final review before merge, or debugging after one failed fix, next to the Opus `reviewer`
   (never instead of it). A different model family catches different mistakes.
 - **Images**: image generation (UI mockups, logos, illustrations) goes to a Codex worker; Claude has none.
 - **Parallel capacity**: an independent piece of a split, as a background worker, when the quota below allows it;
   one or two Codex workers at a time.
 
-Model and effort, always passed to `codex_start` (never the `config.toml` default; the digest cron owns that file).
+Model and effort, always passed to `codex_start` (never the `config.toml` default, which other Codex jobs may rely on).
 `gpt-6.1-sol` is the default and far cheaper than `gpt-6-astra`. Ladder: `sol@medium` (well-specified work, images)
 → `sol@high` (harder steps, reviews) → `sol@xhigh` only with my OK. `gpt-6-astra` only when I ask; `max` and `ultra`
 never without my OK. No Luna, Terra or older models: reading and mechanical edits stay with Haiku scouts.
@@ -136,7 +136,7 @@ Codex quota, the same idea as the Claude budget and boost above, read live: agen
 plan, 5-hour and weekly percent with reset times, the banked resets (each one zeroes both windows) with their expiry,
 `spare_week_percent_per_day` ((100 − weekly %) ÷ days to the weekly reset) and `use_before_lapse_percent_per_day` (the
 same, up to the first banked reset that expires before the weekly reset; null when none does). Call it before each
-Codex launch. One full 5-hour window is roughly 40% of a week (a couple of windows fill it): the 5-hour limit caps how
+Codex launch. One full 5-hour window is roughly 40% of a week (a couple of windows fill it; a machine note can set another share): the 5-hour limit caps how
 fast Codex can use quota, the weekly one how much.
 - Budget: weekly above 75%: drop one rung, no parallel Codex pieces. 5-hour above 90%: no new Codex work until
   `five_hour.resets`. Weekly above 90%: no new Codex worker unless I ask or I spend a banked reset.
@@ -150,3 +150,8 @@ fast Codex can use quota, the weekly one how much.
 
 # Git
 - Never add `Co-Authored-By: Claude …` or `Claude-Session: …` trailers to commits, and no "Generated with Claude Code" line in PRs.
+
+# Machine notes
+This machine's own notes (paths, toolchains, plans) live in the gitignored `local/CLAUDE.md` of this clone, imported
+here when it exists:
+@local/CLAUDE.md
