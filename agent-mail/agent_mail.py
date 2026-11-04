@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,8 +28,9 @@ BUSY = ("starting", "running")  # a runner should exist; if it is dead, revive_d
 TURN_TIMEOUT = 4 * 3600  # seconds; a codex turn still running then is killed and reported as an error
 START_GRACE = 30  # seconds a new worker's runner gets to take its lock before it counts as dead
 INSTRUCTIONS = ("Message other agent sessions. send(to, text) messages a Codex worker (it runs a turn) or any named "
-                "inbox; codex_start launches a Codex worker; list shows workers; inbox reads your unread mail when "
-                "messages are not pushed to you. Worker results arrive as mail from the worker (kind turn_end/error).")
+                "inbox; codex_start launches a Codex worker; list shows workers; retire removes a finished worker's state; "
+                "inbox reads your unread mail when messages are not pushed to you. Worker results arrive as mail "
+                "from the worker (kind turn_end/error).")
 
 
 class MailError(Exception):
@@ -237,6 +239,40 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
     return f"worker {name} starting in {cwd} (sandbox {sandbox}); thread id and results arrive as mail from {name}"
 
 
+def tool_retire(name, force=False):
+    """Delete a worker's record, locks and folder. Holding the runner lock means no turn is running (and none starts)."""
+    check_name(name, "worker name")
+    owner = me() or "unknown"
+
+    def mine():
+        rec = read_worker(name)
+        if rec is None:
+            raise MailError(f"unknown worker {name}")
+        if rec.get("owner") != owner:
+            raise MailError(f"worker {name} belongs to {rec.get('owner')}; only its owner can retire it")
+        return rec
+
+    mine()
+    with open(wdir(name) + ".lock", "w") as lk:  # exists with the record, so this creates nothing new
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise MailError(f"worker {name}: turn running, retry after its turn_end") from None
+        with open(wdir(name) + ".rec.lock", "w") as rk:  # same order as the runner: runner lock, then record lock
+            fcntl.flock(rk, fcntl.LOCK_EX)
+            rec = mine()
+            pending = sum(count_files(os.path.join(wdir(name), sub)) for sub in ("queue", "taken"))
+            if pending and not force:
+                raise MailError(f"worker {name} still has {pending} undelivered message(s); they would be lost: "
+                                "wait for its turn_end, or pass force=true to discard them")
+            shutil.rmtree(wdir(name), ignore_errors=True)
+            for path in (wrec(name), wdir(name) + ".rec.lock", wdir(name) + ".lock"):
+                os.unlink(path)
+    tid = rec.get("thread_id")
+    kept = f"thread {tid} is kept (`codex delete --force {tid}` removes it)" if tid else "thread id was never recorded"
+    return f"retired worker {name}" + (f" (discarded {pending} message(s))" if pending else "") + f". Its Codex {kept}."
+
+
 def tool_list():
     if me():
         revive_dead(me())
@@ -266,6 +302,9 @@ TOOLS = {
                     {"name": {"type": "string"}, "cwd": {"type": "string"}, "prompt": {"type": "string"},
                      "model": {"type": "string"}, "effort": {"type": "string"},
                      "sandbox": {"type": "string", "enum": list(SANDBOXES)}}, ["name", "cwd", "prompt"]),
+    "retire": (tool_retire, "Remove a Codex worker's state (record, locks, queue, logs) once it is finished. Only its "
+               "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept.",
+               {"name": {"type": "string"}, "force": {"type": "boolean"}}, ["name"]),
     "list": (tool_list, "List Codex workers and this inbox's unread count.", {}, []),
     "inbox": (tool_inbox, "Claim and return this instance's unread mail.", {}, []),
 }
@@ -560,7 +599,7 @@ def _drain(name, lk, _hook):
             continue
         rec = read_worker(name)
         if rec is None:
-            return "done"  # retired by hand
+            return "done"  # retired by `retire` (force) while this runner started up
         try:
             ok, text = run_turn(name, rec, msgs)
         except Exception as e:  # any runner bug must still end the turn with an error, never a silent "running"

@@ -206,7 +206,7 @@ class ServerTests(Base):
         c.notify("notifications/whatever")  # unknown notification: ignored, no reply
         self.assertEqual(c.req("ping")["result"], {})
         names = {t["name"] for t in c.req("tools/list")["result"]["tools"]}
-        self.assertEqual(names, {"send", "codex_start", "list", "inbox"})
+        self.assertEqual(names, {"send", "codex_start", "retire", "list", "inbox"})
         self.assertEqual(c.req("nope")["error"]["code"], -32601)
         err, text = c.tool("send", to="x", text="hi")
         self.assertFalse(err)
@@ -636,6 +636,76 @@ class RunnerTests(Base):
         self.start_sync(prompt="new")
         am.run_worker("w1")
         self.assertEqual(self.calls()[-1]["argv"][-1], "new")
+
+    def idle_worker(self, name="w1"):
+        self.start_sync(name)
+        am.run_worker(name)
+        self.assertEqual(am.read_worker(name)["state"], "idle")
+
+    def worker_files(self):
+        return sorted(os.listdir(os.path.join(self.mail, "workers")))
+
+    def test_retire_idle_worker_removes_everything_and_the_name_is_free_again(self):
+        """retire deletes record, both locks and folder; list forgets it; the thread id is in the answer."""
+        self.idle_worker()
+        self.assertEqual(self.worker_files(), ["w1", "w1.json", "w1.lock", "w1.rec.lock"])
+        out = am.tool_retire("w1")
+        self.assertIn("thread-1", out)
+        self.assertIn("codex delete --force thread-1", out)
+        self.assertEqual(self.worker_files(), [])
+        self.assertEqual(json.loads(am.tool_list())["workers"], [])
+        self.start_sync()  # same name again
+        self.assertEqual(am.read_worker("w1")["state"], "starting")
+
+    def test_retire_refuses_a_non_owner(self):
+        """Only the worker's owner may retire it; nothing is touched."""
+        self.idle_worker()
+        os.environ["AGENT_MAIL_NAME"] = "intruder"
+        with self.assertRaisesRegex(am.MailError, "belongs to orch"):
+            am.tool_retire("w1", force=True)
+        self.assertEqual(am.read_worker("w1")["state"], "idle")
+
+    def test_retire_refuses_while_the_runner_lock_is_held(self):
+        """A held runner lock means a turn may be running: refuse, even with force."""
+        import fcntl
+        self.idle_worker()
+        with open(am.wdir("w1") + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            for force in (False, True):
+                with self.assertRaisesRegex(am.MailError, "turn running, retry after its turn_end"):
+                    am.tool_retire("w1", force=force)
+        self.assertIsNotNone(am.read_worker("w1"))
+        am.tool_retire("w1")  # lock free again
+
+    def test_retire_refuses_queued_mail_unless_forced(self):
+        """Undelivered mail (queue/ or taken/) would be lost: refused with its count, removed with force."""
+        self.idle_worker()
+        am.deliver(os.path.join(am.wdir("w1"), "queue"), "orch", "w1", "a")
+        am.deliver(os.path.join(am.wdir("w1"), "taken"), "orch", "w1", "b")
+        with self.assertRaisesRegex(am.MailError, r"2 undelivered message\(s\)"):
+            am.tool_retire("w1")
+        self.assertIsNotNone(am.read_worker("w1"))
+        self.assertIn("discarded 2", am.tool_retire("w1", force=True))
+        self.assertEqual(self.worker_files(), [])
+
+    def test_retire_unknown_and_invalid_names(self):
+        """Unknown worker: a clear error and nothing created; dotted or path-like names never reach the filesystem."""
+        with self.assertRaisesRegex(am.MailError, "unknown worker nope"):
+            am.tool_retire("nope")
+        for bad in ("x.rec", "a.json", "../x", "", ".hidden"):
+            with self.assertRaises(am.MailError, msg=bad):
+                am.tool_retire(bad)
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "workers")))
+
+    def test_retire_over_stdio(self):
+        """The tool is registered with a schema and answers errors as isError results."""
+        c = self.client()
+        c.init()
+        tools = {t["name"]: t for t in c.req("tools/list")["result"]["tools"]}
+        self.assertEqual(tools["retire"]["inputSchema"]["required"], ["name"])
+        err, text = c.tool("retire", name="nope")
+        self.assertTrue(err)
+        self.assertIn("unknown worker", text)
 
     def test_run_cli_without_dir_fails_cleanly(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_MAIL")}

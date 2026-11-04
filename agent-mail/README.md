@@ -11,6 +11,7 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 |---|---|
 | `send(to, text)` | `to` is a Codex worker: the text is queued (and its runner started when you own it). Any other name: written to that inbox. |
 | `codex_start(name, cwd, prompt, model?, effort?, sandbox?)` | Starts a Codex worker. Returns at once; the thread id and every turn result arrive as mail from the worker. |
+| `retire(name, force?)` | Deletes a finished worker's record, locks, queue and logs (owner only). Refused while a turn runs ("retry after its turn_end") and while `queue/` or `taken/` holds mail, unless `force`. The Codex thread is kept; the answer gives its id for `codex delete --force <id>`. |
 | `list()` | Workers (state, thread id, cwd, last message's first line) and this inbox's unread count. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
 
@@ -105,6 +106,5 @@ A fake `codex`, a temp mail dir and temp HOME; nothing reaches the real codex, m
 
 ## Known limits
 
-A turn is killed after 4 hours (`TURN_TIMEOUT`); shell commands a killed codex started can outlive it. No `retire`
-tool (delete `workers/<name>*` by hand). `codex queue` is unreliable and unused. A Claude that declines the channel
+A turn is killed after 4 hours (`TURN_TIMEOUT`); shell commands a killed codex started can outlive it. `codex queue` is unreliable and unused. A Claude that declines the channel
 dialog still gets pushes it drops: answer yes, or start it without the flag and use `inbox`.

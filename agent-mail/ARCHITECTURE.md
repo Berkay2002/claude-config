@@ -14,7 +14,7 @@ flowchart LR
     subgraph Claude["Claude orchestrator (AGENT_MAIL_NAME=project-manager)"]
         C[Claude Code]
         S1["agent_mail.py serve<br/>(stdio MCP)"]
-        C <-->|"tools: send, codex_start, list, inbox"| S1
+        C <-->|"tools: send, codex_start, retire, list, inbox"| S1
         S1 -.->|"notifications/claude/channel<br/>(push)"| C
     end
 
@@ -96,8 +96,8 @@ stateDiagram-v2
     idle --> running: send (queued mail)
     failed --> running: send (thread resumes)
     running --> failed: runner died → owner's server revives it, error mail, messages replayed
-    idle --> [*]: retired by hand (delete workers/name*)
-    failed --> [*]: retired by hand
+    idle --> [*]: retire
+    failed --> [*]: retire
 ```
 
 ## Delivery rules
@@ -132,5 +132,6 @@ $AGENT_MAIL_DIR/
 
 ## Limits
 
-No retire tool, sender names are self-declared, the push needs an interactive Claude with the development-channel flag
-(a `--bg` orchestrator polls `inbox`), and Kiro has no MCP channel, so it is not covered.
+`retire` keeps the Codex thread (`codex delete --force <id>` removes it), sender names are self-declared, the push
+needs an interactive Claude with the development-channel flag (a `--bg` orchestrator polls `inbox`), and Kiro has no
+MCP channel, so it is not covered.

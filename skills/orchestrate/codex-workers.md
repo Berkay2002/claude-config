@@ -35,8 +35,9 @@ Same as step 6 of SKILL.md: `git log main..`, `git diff main...`, merge `--no-ff
 is its report; ask for the report format in the brief.
 
 ## 5. Retire
-When merged or abandoned: remove the worktree (`tidy` skill), then delete `<AGENT_MAIL_DIR>/workers/<name>.json`,
-`<name>.lock`, `<name>.rec.lock` and `<name>/`. There is no retire tool yet.
+When merged or abandoned: `retire(name)` removes the worker's agent-mail state (owner only). It refuses while a turn runs ("retry after its
+`turn_end`") or mail is undelivered (`force=true` discards it), and it keeps the Codex thread: its answer gives the id for
+`codex delete --force <id>` if you want it gone. The worktree is removed with the `tidy` skill.
 
 ## Traps (all checked on the VDI, codex 0.166)
 - `codex exec resume` takes its flags before the thread id and rejects `-C`, `-s` and `--add-dir`; agent-mail handles

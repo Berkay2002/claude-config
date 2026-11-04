@@ -47,6 +47,20 @@ function Link($target, $link) {
 }
 Link (Join-Path $shared 'agents') (Join-Path $claude 'agents')
 Get-ChildItem (Join-Path $shared 'skills') -Directory | ForEach-Object { Link $_.FullName (Join-Path $claude "skills\$($_.Name)") }
+# Codex reads its global rules from $CODEX_HOME\AGENTS.md. A file symlink needs admin or Developer Mode, so this is a copy,
+# refreshed on each run; a symlink you made yourself is left alone. Only where Codex is set up; a failure only warns.
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$codexRules = Join-Path $codexHome 'AGENTS.md'
+if (Test-Path $codexHome -PathType Container) {
+  try {
+    $item = Get-Item $codexRules -ErrorAction SilentlyContinue
+    $src = Read-Utf8 (Join-Path $shared 'codex\AGENTS.md')
+    if (-not ($item -and $item.LinkType) -and -not ($item -and (Read-Utf8 $codexRules) -eq $src)) {
+      if ($item) { Copy-Item $codexRules (Join-Path $backups "codex-AGENTS.md.$stamp") }
+      Write-Utf8 "$codexRules.tmp" $src; Move-Item -Force "$codexRules.tmp" $codexRules
+    }
+  } catch { Write-Warning "Codex rules not copied to ${codexRules}: $($_.Exception.Message)" }
+}
 
 # 3. Plugins: register and update marketplaces, then install missing user-scope plugins named in settings.shared.json. Failures go to stderr and keep the marker back.
 function Fail($text) { [Console]::Error.WriteLine($text); $script:exitCode = 1 }
