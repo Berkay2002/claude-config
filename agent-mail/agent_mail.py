@@ -134,12 +134,14 @@ def read_worker(name):
         return None
 
 
-def update_worker(name, **fields):
-    """Read-modify-write the worker record under flock; returns the new record."""
+def update_worker(name, refuse_live=False, **fields):
+    """Read-modify-write the worker record under flock; returns the new record. refuse_live: raise if it is live."""
     os.makedirs(os.path.dirname(wrec(name)), exist_ok=True)
     with open(wdir(name) + ".rec.lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         rec = read_worker(name) or {"name": name}
+        if refuse_live and rec.get("state") in LIVE:
+            raise MailError(f"worker {name} already exists (state {rec['state']}); use send, or pick another name")
         rec.update(fields, updated=now_iso())
         put_json(wrec(name), rec)
         return rec
@@ -187,14 +189,11 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
     for v, what in ((model, "model"), (effort, "effort")):
         if v is not None and not MODEL_RE.match(str(v)):
             raise MailError(f"invalid {what} {v!r}")
-    old = read_worker(name)
-    if old and old.get("state") in LIVE:
-        raise MailError(f"worker {name} already exists (state {old['state']}); use send, or pick another name")
     owner = me() or "unknown"
+    update_worker(name, refuse_live=True, thread_id=None, cwd=cwd, owner=owner, model=model, effort=effort,
+                  sandbox=sandbox, pid=None, state="starting", last_message="", turns=0)
     for sub in ("queue", "taken"):  # a failed worker being restarted must not replay its old mail
         take(os.path.join(wdir(name), sub), os.path.join(wdir(name), "old"))
-    update_worker(name, thread_id=None, cwd=cwd, owner=owner, model=model, effort=effort, sandbox=sandbox, pid=None,
-                  state="starting", last_message="", turns=0)
     deliver(os.path.join(wdir(name), "queue"), owner, name, prompt)
     spawn_runner(name)
     return f"worker {name} starting in {cwd} (sandbox {sandbox}); thread id and results arrive as mail from {name}"

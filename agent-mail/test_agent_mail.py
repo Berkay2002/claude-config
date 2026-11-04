@@ -458,6 +458,29 @@ class RunnerTests(Base):
         with self.assertRaisesRegex(am.MailError, "AGENT_MAIL_NAME"):
             am.tool_inbox()
 
+    def test_concurrent_starts_of_one_name_start_it_once(self):
+        """The live-name check runs under the record lock, so a start racing another server's start is refused."""
+        import fcntl
+        os.makedirs(os.path.join(self.mail, "workers"), exist_ok=True)
+        out = []
+        with open(am.wdir("w1") + ".rec.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)  # the other server is mid-start
+            t = threading.Thread(target=lambda: out.append(self._try_start()))
+            t.start()
+            time.sleep(0.3)
+            am.put_json(am.wrec("w1"), {"name": "w1", "state": "starting", "owner": "other"})
+        t.join(10)
+        self.assertEqual(out, ["refused"])
+        self.assertEqual(am.read_worker("w1")["owner"], "other")
+        self.assertEqual(am.count_files(os.path.join(am.wdir("w1"), "queue")), 0)
+
+    def _try_start(self):
+        try:
+            self.start_sync()
+            return "ok"
+        except am.MailError:
+            return "refused"
+
     def test_failed_worker_can_be_restarted_without_replaying_old_mail(self):
         self.start_sync(prompt="old")
         self.flag("fail")
