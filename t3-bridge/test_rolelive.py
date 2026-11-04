@@ -22,6 +22,13 @@ PERMISSION_SCREEN = "\n".join([
     "   3. No", "", " Esc to cancel"])
 
 
+def wait_for(cond, timeout=3.0):
+    deadline = time.time() + timeout
+    while not cond() and time.time() < deadline:
+        time.sleep(0.05)
+    return cond()
+
+
 def screen_file(name):
     with open(os.path.join(DATA, name), encoding="utf-8") as f:
         return f.read()
@@ -152,6 +159,17 @@ class Dialogs(Base):
         self.assertFalse(self.s.answer("p1", "allow"))
         self.assertEqual(self.s.keys, [])
 
+    def test_command_only_in_the_history_above_the_dialog_is_not_enough(self):
+        self.open("p1", "Bash", {"command": "echo perm-test > p.txt"})
+        self.s.scr = PERMISSION_SCREEN.format(cmd="rm -rf build")   # the history line above still shows the echo
+        self.assertFalse(self.s.answer("p1", "allow"))
+
+    def test_dialog_whose_hint_contains_another_fails_closed(self):
+        self.open("p1", "Bash", {"command": "echo x"})
+        self.open("p2", "Bash", {"command": "echo x && rm -rf build"})
+        self.s.scr = PERMISSION_SCREEN.format(cmd="echo x && rm -rf build")
+        self.assertFalse(self.s.answer("p2", "allow"))
+
     def test_two_dialogs_with_the_same_hint_fail_closed(self):
         self.open("p1", "Bash", {"command": "echo x"})
         self.open("p2", "Bash", {"command": "echo x"})
@@ -187,6 +205,32 @@ class Dialogs(Base):
         self.open("perm-1", "Bash", {"command": "ls"})
         self.s._entry({"type": "system", "subtype": "turn_duration"})
         self.assertEqual(self.s.kinds()[-2:], ["dialog_closed", "turn_end"])
+
+    def test_tool_use_written_after_the_decision_names_its_dialog(self):
+        self.s._ensure_turn()
+        self.open("perm-1", "Bash", {"command": "echo hi > a.txt"})
+        self.s.scr = PERMISSION_SCREEN.format(cmd="echo hi > a.txt")
+        self.s.answer("perm-1", "allow")
+        self.s._entry(assistant({"type": "tool_use", "id": "t1", "name": "Bash",
+                                 "input": {"command": "echo hi > a.txt"}}))
+        self.assertEqual(self.s.events[-1]["dialog_id"], "perm-1")
+        self.assertEqual(self.s.unbound, {})
+
+    def test_dialog_from_the_spool_carries_the_tool_use_read_before_it(self):
+        self.addCleanup(os.environ.__setitem__, "XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
+        os.environ["XDG_RUNTIME_DIR"] = self.dir
+        self.s._ensure_turn()
+        self.s._entry(assistant({"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}))
+        threading.Thread(target=self.s._tail_spool, daemon=True).start()
+        spool = os.path.join(self.dir, "t3-bridge", "sid-1.jsonl")
+        self.assertTrue(wait_for(lambda: os.path.exists(spool)))
+        time.sleep(0.3)
+        with open(spool, "a") as f:
+            f.write(json.dumps({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                                "tool_input": {"command": "ls"}, "tool_use_id": None}) + "\n")
+        self.assertTrue(wait_for(lambda: self.s.events[-1]["kind"] == "dialog_open"))
+        self.assertEqual(self.s.events[-1]["tool_use_id"], "t1")
+        self.assertEqual(oct(os.stat(spool).st_mode & 0o777), "0o600")
 
 
 class Subagents(Base):
@@ -237,11 +281,12 @@ class Subagents(Base):
 
     def test_background_agent_falls_back_to_meta_finished(self):
         self.launch("tc")
-        self.agent_files("c1", "tc", "background", [], finished=True)
+        self.agent_files("c1", "tc", "background", [assistant({"type": "text", "text": "3 files"})], finished=True)
         self.s._poll_subagents()
         self.s.agents["c1"]["finished_at"] = time.time() - 10
         self.s._poll_subagents()
         self.assertEqual(self.s.events[-1]["kind"], "subagent_end")
+        self.assertEqual(self.s.events[-1]["summary"], "3 files")   # no summary given: the child's last text
 
     def test_agents_launched_before_attach_are_ignored(self):
         self.agent_files("old", "t-old", "foreground", [assistant({"type": "text", "text": "x"})])

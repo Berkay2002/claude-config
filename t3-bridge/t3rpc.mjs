@@ -179,6 +179,7 @@ async function main(argv) {
         workspaceStrategy: { type: "root" },
         initialMessage: { text: need("prompt"), attachments: [] },
       });
+      if (a["no-wait"]) { console.log(JSON.stringify({ threadId })); return 0; }
       const p = await waitIdle(c, threadId, 1, Number(a.timeout ?? 120));
       const expect = need("expect");
       const ok = p.messages.some((m) => m.role === "assistant" && m.text.includes(expect));
@@ -224,7 +225,7 @@ async function main(argv) {
 
 function usage() {
   console.error(`usage: t3rpc.mjs --url URL --pair-url PAIRING_URL [--session-file F] <command>
-  smoke --instance ID --model SLUG --project-dir DIR --prompt TEXT --expect TEXT [--timeout S] [--runtime-mode M]
+  smoke --instance ID --model SLUG --project-dir DIR --prompt TEXT (--expect TEXT | --no-wait) [--timeout S] [--runtime-mode M]
   items --thread ID
   respond --thread ID --request ID (--approve | --decline | --answers JSON)
   send --thread ID --text TEXT [--wait] [--timeout S]

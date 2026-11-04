@@ -14,12 +14,14 @@ session, and the session itself is found through <claude dir>/sessions/<pid>.jso
 
 Events (dicts, key "kind"; names and fields are stable, front ends map them):
     turn_start   origin ("human" typed in tmux/RC/a front end, "peer", "task-notification", ...), text, by_us, peer
-    text / thinking / tool_use   block (the API content block), message (id, model, usage; no content), uuid
+    text / thinking / tool_use   block (the API content block), message (id, model, usage; no content), uuid;
+                 tool_use also has dialog_id when it is the call of a dialog announced before its tool_use was read
     tool_result  block, tool (name of the tool_use it closes), tool_use_result (the CLI's structured result), uuid
     turn_end     reason ("done" | "interrupted"), last_text
     subagent_start  id (agent id), tool_use_id (the Agent call), description, prompt, agent_type, background
     subagent_end    id, tool_use_id, status ("completed" | "failed" | "stopped" | ...), summary
-    dialog_open  id, dialog ("question" | "permission"), tool, input
+    dialog_open  id, dialog ("question" | "permission"), tool, input, tool_use_id (the tool_use it belongs to when
+                 already read, else None: a permission dialog's tool_use may only be written once it is decided)
     dialog_closed id, by ("us" | "elsewhere")
     send_failed  text, reason ("draft": the pane's input line held someone's draft, "dialog": a dialog was open,
                  "timeout": the text never showed up as a prompt, "tmux": tmux refused)
@@ -140,11 +142,13 @@ class LiveSession:
         self.lock = threading.RLock()
         self.turn = None                 # {"by_us", "last_text", "started"}
         self.sent = []                   # [text, sent_at] sent by us whose prompt entry hasn't shown yet
-        self.dialogs = {}                # id -> {"dialog", "tool", "input", "synthetic"}
+        self.dialogs = {}                # id -> {"dialog", "tool", "input", "synthetic", "tool_use_id"}
+        self.unbound = {}                # answered dialog id -> (tool, input) until its tool_use shows up
         self.tool_names = {}             # tool_use id -> tool name, so tool_result can say which tool it closes
         self.tool_inputs = {}            # tool_use id -> (name, input) until its tool_result
         self.launches = {}               # Agent tool_use id -> its input (subagents start only for seen launches)
         self.agents = {}                 # agent id -> {"tool_use_id", "path", "f", "buf", "done", "background"}
+        self.agent_text = {}             # Agent tool_use id -> the subagent's last text
         self.last_line_at = 0.0
         self.idle_since = None
         self.state_key = None
@@ -380,13 +384,17 @@ class LiveSession:
         if d["dialog"] == "question":
             qs = d["input"].get("questions") or [{}]
             return scr if " ".join(str(qs[0].get("question", "")).split())[:40] in flat else None
-        if not re.search(r"❯ 1\. Yes", scr):
+        lines = scr.split("\n")
+        yes = [i for i, ln in enumerate(lines) if re.match(r"\s*❯ 1\. Yes", ln)]
+        if not yes:
             return None
+        top = max([i for i, ln in enumerate(lines[:yes[-1]]) if ln.lstrip().startswith("─")], default=-1)
+        region = re.sub(r"\s+", "", "".join(lines[top + 1:yes[-1]]))   # the dialog box only, not the history above
         hint = permission_hint(d)
-        bare = re.sub(r"\s+", "", scr)   # the TUI wraps long commands and paths anywhere
         with self.lock:
-            twins = [o for o in self.dialogs.values() if o is not d and permission_hint(o) == hint]
-        return scr if hint and hint in bare and not twins else None
+            others = [permission_hint(o) for o in self.dialogs.values() if o is not d]
+        twins = [h for h in others if h and hint and (h in hint or hint in h)]
+        return scr if hint and hint in region and not twins else None
 
     def answer(self, dialog_id, choice):
         """Answer an open dialog in the TUI. question: {question: label | "a, b" | free text}; permission: allow/deny."""
@@ -401,6 +409,8 @@ class LiveSession:
             return False
         with self.lock:
             self.dialogs.pop(dialog_id, None)
+            if d["synthetic"] and not d.get("tool_use_id"):
+                self.unbound[dialog_id] = (d["tool"], d["input"])
         if d["dialog"] == "permission":
             if choice == "allow":
                 self._keys("1")   # "Yes" once; never the "don't ask again" rows, which can write settings files
@@ -435,6 +445,7 @@ class LiveSession:
     # ---- output: transcript ----
     def _turn_end(self, reason):
         t, self.turn = self.turn, None
+        self.unbound.clear()
         for did in list(self.dialogs):   # a dialog never outlives its turn
             self.dialogs.pop(did)
             self.emit({"kind": "dialog_closed", "id": did, "by": "elsewhere"})
@@ -463,14 +474,23 @@ class LiveSession:
                 kind = b.get("type")
                 if kind == "text" and parent is None:
                     self.turn["last_text"] = b.get("text", "")
+                elif kind == "text":
+                    self.agent_text[parent] = b.get("text", "")   # the summary when the end says nothing
+                extra = {}
                 if kind == "tool_use":
-                    self.tool_names[b.get("id")] = b.get("name")
+                    tid, call = b.get("id"), (b.get("name"), b.get("input"))
+                    self.tool_names[tid] = b.get("name")
                     if b.get("name") in AGENT_TOOLS:
-                        self.launches[b.get("id")] = b.get("input") or {}
-                    self.tool_inputs[b.get("id")] = (b.get("name"), b.get("input"))
+                        self.launches[tid] = b.get("input") or {}
+                    self.tool_inputs[tid] = call
                     self._bind_dialogs()
+                    did = next((k for k, d in self.dialogs.items() if d["synthetic"] and d.get("tool_use_id") == tid),
+                               None) or next((k for k, c in self.unbound.items() if c == call), None)
+                    if did:
+                        self.unbound.pop(did, None)
+                        extra = {"dialog_id": did}
                 if kind in ("text", "thinking", "tool_use"):
-                    self.emit({"kind": kind, "block": b, "message": m, "uuid": e.get("uuid"), **meta})
+                    self.emit({"kind": kind, "block": b, "message": m, "uuid": e.get("uuid"), **meta, **extra})
                 elif kind != "redacted_thinking":
                     self.notice(f"assistant block type {kind!r} not understood")
             return True
@@ -633,6 +653,8 @@ class LiveSession:
         if a.get("f"):
             a["f"].close()
         self.launches.pop(a["tool_use_id"], None)
+        summary = summary or self.agent_text.get(a["tool_use_id"], "")
+        self.agent_text.pop(a["tool_use_id"], None)
         self.emit({"kind": "subagent_end", "id": aid, "tool_use_id": a["tool_use_id"], "status": status,
                    "summary": summary[:2000], **self._meta})
 
@@ -719,7 +741,8 @@ class LiveSession:
                 self.dialogs[did] = d
                 self._bind_dialogs()
                 self._ensure_turn()
-                self.emit({"kind": "dialog_open", "id": did, **{k: d[k] for k in ("dialog", "tool", "input")}})
+                self.emit({"kind": "dialog_open", "id": did, "tool_use_id": d.get("tool_use_id"),
+                           **{k: d[k] for k in ("dialog", "tool", "input")}})
 
     # ---- session watch: /clear, restart, idle fallback for turn end, lost sends ----
     def _watch(self):

@@ -103,6 +103,7 @@ class Bridge:
         self.pending_notices = []
         self.requests = {}          # can_use_tool request_id -> dialog id
         self.by_dialog = {}
+        self.alias = {}             # real tool_use id -> the dialog id T3 knows that call by
         self.tasks = {}             # background agent id -> description (T3's background roster)
         self.announced = set()      # agent ids whose task_started went out
         self.offset = 0             # newest main-transcript offset whose turn T3 has got
@@ -247,8 +248,14 @@ class Bridge:
         if k == "subagent_end":
             return self.task_notification(ev)
         if k in ("text", "thinking", "tool_use"):
-            return self.assistant(ev["block"], ev["message"], ev.get("uuid"), parent)
+            block = ev["block"]
+            if ev.get("dialog_id"):   # T3 already has this call as the dialog's tool_use_id: keep one item
+                self.alias[block["id"]] = ev["dialog_id"]
+                block = {**block, "id": ev["dialog_id"]}
+            return self.assistant(block, ev["message"], ev.get("uuid"), parent)
         if k == "tool_result":
+            if ev["block"].get("tool_use_id") in self.alias:
+                ev = {**ev, "block": {**ev["block"], "tool_use_id": self.alias.pop(ev["block"]["tool_use_id"])}}
             tur = ev.get("tool_use_result")
             if isinstance(tur, dict) and tur.get("status") == "async_launched" and tur.get("agentId"):
                 self.task_started(tur["agentId"], ev["block"].get("tool_use_id"), tur.get("description", ""),
@@ -316,7 +323,7 @@ class Bridge:
             self.requests[rid], self.by_dialog[ev["id"]] = ev["id"], rid
             return self.emit({"type": "control_request", "request_id": rid, "request": {
                 "subtype": "can_use_tool", "tool_name": ev["tool"], "display_name": ev["tool"],
-                "input": ev["input"], "tool_use_id": ev["id"],
+                "input": ev["input"], "tool_use_id": ev.get("tool_use_id") or ev["id"],
                 "requires_user_interaction": ev["dialog"] == "question"}})
         rid = self.by_dialog.pop(ev["id"], None)
         if rid and ev["by"] == "elsewhere":   # answered in tmux or RC: close T3's dialog

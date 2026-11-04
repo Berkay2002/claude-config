@@ -228,6 +228,20 @@ class Dialogs(Base):
         self.ev("dialog_closed", id="perm-1", by="elsewhere")
         self.assertEqual(self.frames(), [{"type": "control_cancel_request", "request_id": rid}])
 
+    def test_call_written_after_its_dialog_keeps_the_dialog_id(self):
+        self.open_dialog()
+        self.ev("tool_use", block={"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}, message={},
+                dialog_id="perm-1")
+        self.ev("tool_result", block={"type": "tool_result", "tool_use_id": "t1", "content": ""}, tool="Bash")
+        f = self.frames()
+        self.assertEqual(f[0]["message"]["content"][0]["id"], "perm-1")
+        self.assertEqual(f[1]["message"]["content"][0]["tool_use_id"], "perm-1")
+
+    def test_dialog_for_a_call_t3_has_uses_its_id(self):
+        self.t3_turn()
+        self.ev("dialog_open", id="perm-2", dialog="permission", tool="Bash", input={}, tool_use_id="t9")
+        self.assertEqual(self.frames()[-1]["request"]["tool_use_id"], "t9")
+
 
 class Controls(Base):
     def control(self, subtype, **req):
