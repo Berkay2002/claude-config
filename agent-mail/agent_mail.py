@@ -5,14 +5,17 @@ Codex workers. `agent_mail.py serve` (default) is the MCP server; `agent_mail.py
 Everything comes from env: AGENT_MAIL_DIR (absolute mail root, required), AGENT_MAIL_NAME (who this instance is),
 AGENT_MAIL_CODEX (codex binary, default `codex` on PATH), CODEX_HOME (passed through to codex). Never defaults to ~.
 """
+import ctypes
 import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 
@@ -20,6 +23,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # no dots: `x.rec` wo
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
 SANDBOXES = ("full", "workspace-write", "read-only")  # loosest to tightest
 LIVE = ("starting", "running", "idle")
+BUSY = ("starting", "running")  # a runner should exist; if it is dead, revive_dead() starts one, which reports it
+TURN_TIMEOUT = 4 * 3600  # seconds; a codex turn still running then is killed and reported as an error
+START_GRACE = 30  # seconds a new worker's runner gets to take its lock before it counts as dead
 INSTRUCTIONS = ("Message other agent sessions. send(to, text) messages a Codex worker (it runs a turn) or any named "
                 "inbox; codex_start launches a Codex worker; list shows workers; inbox reads your unread mail when "
                 "messages are not pushed to you. Worker results arrive as mail from the worker (kind turn_end/error).")
@@ -147,6 +153,32 @@ def update_worker(name, refuse_live=False, **fields):
         return rec
 
 
+def runner_alive(name, pid):
+    """Is `pid` still `agent_mail.py run <name>`? The cmdline check guards against pid reuse; a zombie has none."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            args = f.read().split(b"\0")
+    except (OSError, TypeError, ValueError):
+        return False
+    return b"run" in args and name.encode() in args
+
+
+def revive_dead(owner=None):
+    """Start a runner for every busy worker (of `owner`, or all) whose runner died; the new runner tells the owner."""
+    wd = os.path.join(root(), "workers")
+    for fn in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
+        r = read_worker(fn[:-5]) if fn.endswith(".json") else None
+        if not r or r.get("state") not in BUSY or (owner and r.get("owner") != owner):
+            continue
+        if r.get("pid") is None:  # not started yet: give spawn_runner its moment
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(r.get("updated") or now_iso())
+            if age.total_seconds() < START_GRACE:
+                continue
+        elif runner_alive(r["name"], r["pid"]):
+            continue
+        spawn_runner(r["name"])
+
+
 # ---------- tools ----------
 
 def spawn_runner(name):
@@ -200,6 +232,7 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
 
 
 def tool_list():
+    revive_dead()
     recs = []
     wd = os.path.join(root(), "workers")
     for fn in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
@@ -282,7 +315,8 @@ class Server:
                         return
                     if self.stop.is_set():
                         return
-            except (MailError, OSError):
+                revive_dead(me())
+            except (MailError, OSError, ValueError):
                 pass
             self.stop.wait(interval)
 
@@ -391,7 +425,26 @@ def codex_args(rec, tid, last, text):
 def format_turn(rec, tid, msgs):
     if not tid and len(msgs) == 1 and msgs[0]["from"] == rec.get("owner"):
         return msgs[0]["text"]  # the start prompt, as the owner wrote it
-    return "\n\n".join(f"From {m['from']}:\n{m['text']}" for m in msgs)
+    text = "\n\n".join(f"From {m['from']}:\n{m['text']}" for m in msgs)
+    if rec.get("interrupted") and tid:
+        text = "(Your previous turn was cut off when its runner died; these messages are sent again.)\n\n" + text
+    return text
+
+
+_prctl = ctypes.CDLL(None, use_errno=True).prctl  # resolved before any fork: no dlopen in the child
+
+
+def _die_with_runner():
+    """preexec_fn for codex: SIGKILL it when the runner dies, so a revived runner never resumes the thread twice."""
+    _prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG; tied to the forking thread, the runner's main thread
+
+
+def _kill_group(p, killed):
+    killed.append(1)
+    try:
+        os.killpg(p.pid, signal.SIGKILL)  # codex runs in its own session: this takes its commands down too
+    except ProcessLookupError:
+        pass
 
 
 def run_turn(name, rec, msgs):
@@ -405,39 +458,55 @@ def run_turn(name, rec, msgs):
     tid = rec.get("thread_id")
     argv = codex_args(rec, tid, last, format_turn(rec, tid, msgs))
     update_worker(name, state="running", turns=n)
-    failed = None
+    killed = []
+    env = dict(os.environ, AGENT_MAIL_NAME=name)  # codex's own commands act as the worker, not as its sender
     with open(jsonl, "w") as jf, open(err, "w") as ef:
         try:
             p = subprocess.Popen(argv, cwd=rec["cwd"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=ef,
-                                 text=True)
+                                 encoding="utf-8", errors="replace", env=env, start_new_session=True,
+                                 preexec_fn=_die_with_runner)
         except OSError as e:
             return False, f"could not start codex ({argv[0]}): {e}; log: {err}"
-        for line in p.stdout:  # type: ignore[union-attr]
-            jf.write(line)
-            jf.flush()
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue  # not JSON: ignore
-            if not isinstance(ev, dict):
-                continue
-            if ev.get("type") == "thread.started" and not tid and ev.get("thread_id"):
-                tid = ev["thread_id"]  # a resume's thread.started never overwrites the recorded id
-                update_worker(name, thread_id=tid)
-                deliver(inbox_dir(rec["owner"]), name, rec["owner"], f"worker {name} started, thread {tid}",
-                        "message", tid)
-            elif ev.get("type") == "turn.failed":
-                failed = json.dumps(ev.get("error", ev))[:500]
-        rc = p.wait()
-        p.stdout.close()  # type: ignore[union-attr]
+        timer = threading.Timer(TURN_TIMEOUT, _kill_group, (p, killed))
+        timer.start()
+        try:
+            tid, failed, rc = _read_events(name, rec, p, jf, tid)
+        finally:
+            timer.cancel()
+            timer.join()  # no thread may exist at the next Popen (preexec_fn)
+            p.stdout.close()  # type: ignore[union-attr]
     text = ""
     if os.path.exists(last):
-        with open(last) as f:
+        with open(last, encoding="utf-8", errors="replace") as f:
             text = f.read().strip()
+    if killed:
+        return False, f"codex turn {n} timed out after {TURN_TIMEOUT} s and was killed; log: {jsonl} (stderr {err})"
     if rc != 0 or failed or not text:
         why = f"exit code {rc}" + (f", turn.failed {failed}" if failed else "") + ("" if text else ", no last message")
         return False, f"codex turn {n} failed: {why}; log: {jsonl} (stderr {err})"
     return True, text
+
+
+def _read_events(name, rec, p, jf, tid):
+    """Copy codex's JSONL to the log, record the thread id; returns (thread_id, turn.failed error or None, rc)."""
+    failed = None
+    for line in p.stdout:  # type: ignore[union-attr]
+        jf.write(line)
+        jf.flush()
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue  # not JSON: ignore
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "thread.started" and not tid and ev.get("thread_id"):
+            tid = ev["thread_id"]  # a resume's thread.started never overwrites the recorded id
+            update_worker(name, thread_id=tid)
+            deliver(inbox_dir(rec["owner"]), name, rec["owner"], f"worker {name} started, thread {tid}",
+                    "message", tid)
+        elif ev.get("type") == "turn.failed":
+            failed = json.dumps(ev.get("error", ev))[:500]
+    return tid, failed, p.wait()
 
 
 def run_worker(name, _hook=None):
@@ -454,12 +523,22 @@ def _drain(name, lk, _hook):
     except BlockingIOError:
         return "locked"
     queue, taken = os.path.join(wd, "queue"), os.path.join(wd, "taken")
+    old = read_worker(name) or {}
     update_worker(name, pid=os.getpid())
+    stale = take(taken, queue)  # left by a runner that died mid-turn; file names keep their order
+    if stale or old.get("state") == "running":
+        rec = update_worker(name, state="failed", interrupted=True)
+        report(rec, False, f"the runner of {name} (pid {old.get('pid')}) died during turn {old.get('turns')}; "
+                           f"{len(stale)} message(s) requeued for the next turn")
     while True:
-        msgs = take(queue, taken)
+        claimed = list(claim(queue, taken))
+        msgs = [m for _, m in claimed]
         if not msgs:
             if _hook:
                 _hook()
+            rec = read_worker(name) or {}
+            if rec.get("state") in BUSY:  # nothing to run, yet a runner was expected: say so, or it is revived forever
+                report(update_worker(name, state="failed"), False, f"the runner of {name} found no message to run")
             # Exit race: a send may land between "queue empty" and our exit and its runner would bounce off the lock.
             fcntl.flock(lk, fcntl.LOCK_UN)
             if not count_files(queue):
@@ -470,11 +549,24 @@ def _drain(name, lk, _hook):
                 return "done"  # the new runner has it
             continue
         rec = read_worker(name)
-        ok, text = run_turn(name, rec, msgs)
+        if rec is None:
+            return "done"  # retired by hand
+        try:
+            ok, text = run_turn(name, rec, msgs)
+        except Exception as e:  # any runner bug must still end the turn with an error, never a silent "running"
+            traceback.print_exc()
+            ok, text = False, f"runner error in a turn of {name}: {e!r}; log: {os.path.join(wd, 'logs', 'runner.log')}"
         first = text.split("\n", 1)[0]
-        update_worker(name, state="idle" if ok else "failed", last_message=text if ok else first)
-        deliver(inbox_dir(rec["owner"]), name, rec["owner"], text, "turn_end" if ok else "error",
-                (read_worker(name) or {}).get("thread_id"))
+        report(update_worker(name, state="idle" if ok else "failed", last_message=text if ok else first,
+                             interrupted=False), ok, text)
+        for path, _ in claimed:  # only after the result is out: a crash before this replays the turn, never drops it
+            os.unlink(path)
+
+
+def report(rec, ok, text):
+    """Mail a turn result (or a runner failure) to the worker's owner."""
+    deliver(inbox_dir(rec["owner"]), rec["name"], rec["owner"], text, "turn_end" if ok else "error",
+            rec.get("thread_id"))
 
 
 def main(argv):

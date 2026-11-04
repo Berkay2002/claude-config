@@ -29,7 +29,8 @@ resume = a[1:2] == ["resume"]
 last, prompt = a[a.index("-o") + 1], a[-1]
 tid = a[-2] if resume else None
 with open(d + "/calls.jsonl", "a") as f:
-    f.write(json.dumps({"argv": a, "cwd": os.getcwd(), "stdin": os.readlink("/proc/self/fd/0")}) + "\\n")
+    f.write(json.dumps({"argv": a, "cwd": os.getcwd(), "stdin": os.readlink("/proc/self/fd/0"),
+                        "name": os.environ.get("AGENT_MAIL_NAME"), "pid": os.getpid()}) + "\\n")
 def p(o): print(json.dumps(o), flush=True)
 if os.path.exists(d + "/otherid") and resume:
     p({"type": "thread.started", "thread_id": "resume-other"})
@@ -47,6 +48,15 @@ p({"type": "turn.completed"})
 
 
 RELAY = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:3] + ['serve']))"
+
+
+def gone(pid):
+    """The process has exited (no /proc entry, or a zombie with an empty cmdline)."""
+    try:
+        with open(f"/proc/{pid}/cmdline") as f:
+            return not f.read()
+    except OSError:
+        return True
 
 
 def wait_for(cond, timeout=15):
@@ -459,6 +469,76 @@ class RunnerTests(Base):
             a = am.codex_args(rec, tid, "/l", "--dangerously-bypass-approvals-and-sandbox")
             self.assertEqual(a[a.index("--"):], ["--"] + ([tid] if tid else []) + [a[-1]])
             self.assertEqual(a.count("--dangerously-bypass-approvals-and-sandbox"), 2)  # the flag itself + the prompt
+
+    def test_turn_timeout_kills_codex_and_reports_an_error(self):
+        """A hung turn must not keep the worker `running`: it is killed and reported."""
+        self.start_sync()
+        self.flag("sleep", "30")
+        with mock.patch.object(am, "TURN_TIMEOUT", 0.5):
+            t0 = time.time()
+            am.run_worker("w1")
+        self.assertLess(time.time() - t0, 10)
+        (err,) = [m for m in self.box() if m["kind"] == "error"]
+        self.assertIn("timed out", err["text"])
+        self.assertEqual(am.read_worker("w1")["state"], "failed")
+        self.assertTrue(gone(self.calls()[0]["pid"]))
+
+    def test_runner_killed_mid_turn_is_revived_and_replays_the_turn(self):
+        """SIGKILL the runner mid-turn: codex dies with it, the owner hears of it and the message is not lost."""
+        self.flag("sleep", "30")
+        with mock.patch.object(am, "spawn_runner"):
+            am.tool_codex_start("w1", self.cwd, "first")
+        os.environ["AGENT_MAIL_NAME"] = "bob"
+        with mock.patch.object(am, "spawn_runner"):
+            am.tool_send("w1", "second")  # queued before the runner starts: both go into turn 1
+        os.environ["AGENT_MAIL_NAME"] = "orch"
+        runner = subprocess.Popen([sys.executable, AM, "run", "w1"], start_new_session=True)
+        wait_for(lambda: self.calls())
+        codex_pid = self.calls()[0]["pid"]
+        runner.kill()
+        runner.wait()
+        wait_for(lambda: gone(codex_pid))  # PR_SET_PDEATHSIG: no orphan codex keeps working on the thread
+        self.assertEqual(am.read_worker("w1")["state"], "running")
+        os.unlink(os.path.join(self.tmp, "sleep"))
+        json.loads(am.tool_list())  # list notices the dead runner and starts a new one
+        wait_for(lambda: [m for m in self.box() if m["kind"] == "turn_end"])
+        kinds = [m["kind"] for m in self.box()]
+        self.assertEqual(kinds, ["message", "error", "turn_end"])
+        self.assertIn("2 message(s) requeued", self.box()[1]["text"])
+        replay = self.calls()[1]["argv"]
+        self.assertEqual(replay[-2], "thread-1")
+        self.assertIn("cut off", replay[-1])
+        self.assertIn("From orch:\nfirst\n\nFrom bob:\nsecond", replay[-1])
+        wait_for(lambda: am.read_worker("w1")["state"] == "idle")
+        self.assertEqual(os.listdir(os.path.join(am.wdir("w1"), "taken")), [])
+
+    def test_revive_skips_live_and_just_started_workers(self):
+        """A live runner or a record still inside its start grace is left alone."""
+        self.start_sync()
+        with mock.patch.object(am, "spawn_runner") as sp:
+            am.revive_dead()  # starting, pid None, fresh: grace
+            am.update_worker("w1", state="running", pid=os.getpid())
+            am.revive_dead()  # the pid is alive but is not `agent_mail.py run w1`: pid reuse, so it is dead
+            self.assertEqual(sp.call_count, 1)
+            am.update_worker("w1", state="idle", pid=None)
+            am.revive_dead()
+            self.assertEqual(sp.call_count, 1)
+
+    def test_a_runner_bug_ends_the_turn_with_an_error(self):
+        """Any exception inside a turn becomes an error event and state failed, not a silent `running`."""
+        self.start_sync()
+        with mock.patch.object(am, "codex_args", side_effect=RuntimeError("bug")), mock.patch("traceback.print_exc"):
+            am.run_worker("w1")
+        (err,) = [m for m in self.box() if m["kind"] == "error"]
+        self.assertIn("bug", err["text"])
+        self.assertEqual(am.read_worker("w1")["state"], "failed")
+
+    def test_codex_runs_as_the_worker_and_taken_is_emptied(self):
+        """Codex's own commands see the worker's name, not the sender's; a finished turn leaves nothing to replay."""
+        self.start_sync()
+        am.run_worker("w1")
+        self.assertEqual(self.calls()[0]["name"], "w1")
+        self.assertEqual(os.listdir(os.path.join(am.wdir("w1"), "taken")), [])
 
     def test_validation(self):
         for bad in ("../x", "a/b", "", ".hidden", "x" * 80):
