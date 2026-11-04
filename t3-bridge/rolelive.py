@@ -50,6 +50,7 @@ EFFORTS = set(EFFORT_ORDER)
 SEND_TIMEOUT = 45          # seconds a sent text may stay unseen while the session is idle
 DRAFT_WAIT = 5             # seconds to wait for someone's draft in the pane to clear before refusing a send
 SGR = re.compile(r"\x1b\[[0-9;:]*m")
+PASTED = re.compile(r"(?:\[Pasted text #\d+[^\]]*\]\s*)+")   # how the box shows a long paste
 DIM = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)", re.S)   # placeholder and suggestion text is dim
 
 
@@ -251,13 +252,30 @@ class LiveSession:
         return r.stdout.decode(errors="replace") if r.returncode == 0 else ""
 
     def _paste(self, text, submit=True):
+        """True when pasted (and submitted), False when tmux refused, None when the box showed more than our paste
+        (someone typed in the meantime): then Enter is not pressed and the box is left as it is."""
         # Named buffer + bracketed paste (-p): newlines don't submit early and the user's paste buffer is untouched.
         ok = self._tmux("load-buffer", "-b", "rolelive", "-", data=text.encode())
         ok = ok and self._tmux("paste-buffer", "-d", "-p", "-b", "rolelive", "-t", self.pane)
         if ok and submit:
-            time.sleep(0.3)
+            if not self._box_is(text):
+                # Never cleared: the cursor position is unknown, so deleting could eat the other person's keys.
+                self.notice("someone typed into the input box while a message was pasted; not submitted, the box "
+                            f"holds both texts: {text[:200]}")
+                return None
             ok = self._tmux("send-keys", "-t", self.pane, "Enter")
         return ok
+
+    def _box_is(self, text):
+        """The prompt box shows exactly the pasted text (wrapping aside), or only the CLI's placeholder for a long
+        paste. Polled briefly: the paste takes a moment to reach the screen."""
+        want = re.sub(r"\s+", "", text)
+        for _ in range(4):
+            time.sleep(0.3)
+            box = input_line(self.screen(escapes=True))
+            if box is not None and (re.sub(r"\s+", "", box) == want or PASTED.fullmatch(box)):
+                return True
+        return False
 
     def _keys(self, *keys):
         for k in keys:
@@ -291,11 +309,12 @@ class LiveSession:
         if reason is None:
             with self.lock:
                 self.sent.append([text, time.time()])
-            if self._paste(text):
+            pasted = self._paste(text)
+            if pasted:
                 return True
             with self.lock:
                 self.sent = [s for s in self.sent if s[0] is not text]
-            reason = "tmux"
+            reason = "tmux" if pasted is False else "draft"
         self.emit({"kind": "send_failed", "text": text, "reason": reason})
         return False
 

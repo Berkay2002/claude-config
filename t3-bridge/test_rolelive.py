@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,6 +146,47 @@ class Send(Base):
         self.s.idle_since = time.time() - 100
         self.s._expire_sends(time.time())
         self.assertEqual(self.s.kinds(), ["turn_start"])
+
+
+class Paste(Base):
+    """The real _paste, with tmux stubbed: the pane shows `after` once the paste is in."""
+
+    def setUp(self):
+        super().setUp()
+        self.s._paste = types.MethodType(rolelive.LiveSession._paste, self.s)
+        self.s._tmux = self.tmux
+        self.s.scr = screen_file("screen-empty.txt")
+
+    def tmux(self, *args, data=None):
+        self.s.keys.append(args)
+        if args[0] == "paste-buffer":
+            self.s.scr = self.after
+        return True
+
+    def box(self, text):   # screen-empty.txt with text typed in its prompt box
+        head, sep, tail = screen_file("screen-empty.txt").rpartition("❯ ")
+        return head + sep + text + tail
+
+    def entered(self):
+        return ("send-keys", "-t", "%1", "Enter") in self.s.keys
+
+    def test_enter_when_the_box_shows_the_paste(self):
+        self.after = self.box("hello   there")
+        self.assertTrue(self.s.send("hello there"))
+        self.assertTrue(self.entered())
+
+    def test_long_paste_shown_as_a_placeholder_is_submitted(self):
+        self.after = self.box("[Pasted text #1 +29 lines]")
+        self.assertTrue(self.s.send("\n".join(f"line {i}" for i in range(30))))
+        self.assertTrue(self.entered())
+
+    def test_keystroke_merged_into_the_paste_is_not_submitted(self):
+        self.after = screen_file("screen-draft.txt")   # someone typed before Enter: the box is not just our text
+        self.assertFalse(self.s.send("hello"))
+        self.assertFalse(self.entered())
+        self.assertEqual(self.s.kinds(), ["notice", "send_failed"])
+        self.assertEqual(self.s.events[-1]["reason"], "draft")
+        self.assertEqual(self.s.sent, [])
 
 
 class Dialogs(Base):
