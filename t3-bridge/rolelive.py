@@ -550,6 +550,13 @@ class LiveSession:
                 self.notice(f"transcript system entry {st!r} not understood")
             return
         if et == "attachment":   # a background agent's result can arrive mid-turn as an attachment
+            a = e.get("attachment") or {}
+            # A prompt pasted while a turn runs is absorbed into that turn: no user entry, only this attachment.
+            # Emitted without _turn_start: the CLI's turn goes on, so no turn_end and its dialogs stay open.
+            if (a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind") in (None, "human")
+                    and self._ours(str(a.get("prompt") or ""))):
+                self.emit({"kind": "turn_start", "origin": "human", "text": a["prompt"], "by_us": True,
+                           "peer": None, **self._meta})
             for text in strings(e):
                 if "<task-notification>" in text:
                     self._task_notification(text)
@@ -573,18 +580,19 @@ class LiveSession:
             return   # skill bodies, local command output, /model echoes, ...
         kind = origin.get("kind") or e.get("turnOrigin") or "human"
         body = origin.get("body") or text
-        by_us = False
-        if kind == "human" and self.sent:
-            # Our pastes come back as typed prompts, in order. A tmux/RC prompt racing ours is told apart by text.
-            norm = lambda s: " ".join(s.split())
-            for i, (s, _) in enumerate(self.sent):
-                if norm(s)[:60] in norm(body):   # prefix: the CLI rewrites @file mentions and pasted images
-                    del self.sent[:i + 1]
-                    by_us = True
-                    break
-        self._turn_start(kind, body, by_us, origin.get("name"))
+        self._turn_start(kind, body, kind == "human" and self._ours(body), origin.get("name"))
         if "<task-notification>" in body:
             self._task_notification(body)
+
+    def _ours(self, body):
+        """Our pastes come back as typed prompts, in order. A tmux/RC prompt racing ours is told apart by text.
+        A match drops it (and any older lost send) from the pending sends."""
+        norm = lambda s: " ".join(s.split())
+        for i, (s, _) in enumerate(self.sent):
+            if norm(s)[:60] in norm(body):   # prefix: the CLI rewrites @file mentions and pasted images
+                del self.sent[:i + 1]
+                return True
+        return False
 
     def _task_notification(self, text):
         n = task_notification(text)

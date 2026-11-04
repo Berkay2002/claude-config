@@ -129,6 +129,23 @@ class Send(Base):
         self.assertTrue(self.s.events[-1]["by_us"])
         self.assertEqual(self.s.sent, [])
 
+    def test_send_absorbed_mid_turn_is_ours_and_not_expired(self):
+        # Pasted while a turn runs: no user entry, a queue-operation plus a queued_command attachment instead.
+        self.s.sent = [["please also check the notes file", time.time() - 100]]
+        self.s._entry(prompt("go"))
+        self.s.dialogs["p1"] = {"dialog": "permission", "tool": "Bash", "input": {"command": "ls"}, "synthetic": True}
+        self.s.events.clear()
+        with open(os.path.join(DATA, "absorbed-mid-turn.jsonl")) as f:
+            for ln in f:
+                self.s._entry(json.loads(ln))
+        self.assertEqual(self.s.events, [{"kind": "turn_start", "origin": "human", "by_us": True, "peer": None,
+                                          "text": "please also check the  notes file"}])
+        self.assertEqual(self.s.sent, [])
+        self.assertIn("p1", self.s.dialogs)   # the CLI's turn goes on: no turn_end, no dialog closed
+        self.s.idle_since = time.time() - 100
+        self.s._expire_sends(time.time())
+        self.assertEqual(self.s.kinds(), ["turn_start"])
+
 
 class Dialogs(Base):
     def open(self, did, tool, inp, synthetic=True):
