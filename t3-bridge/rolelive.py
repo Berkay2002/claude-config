@@ -24,7 +24,8 @@ Events (dicts, key "kind"; names and fields are stable, front ends map them):
                  already read, else None: a permission dialog's tool_use may only be written once it is decided)
     dialog_closed id, by ("us" | "elsewhere")
     send_failed  text, reason ("draft": the pane's input line held someone's draft, "dialog": a dialog was open,
-                 "timeout": the text never showed up as a prompt, "tmux": tmux refused)
+                 "timeout": the text never showed up as a prompt, "tmux": tmux refused, "session": the pane no
+                 longer runs the attached session under its name; the core re-resolves the role before the next send)
     session      session_id, pane, switched (bool)   (attach, /clear or restart)
     notice       text   (anything the core did not understand: never dropped silently)
   Transcript events also carry parent_tool_use_id (None, or the Agent call a subagent's event belongs to), offset
@@ -306,7 +307,13 @@ class LiveSession:
         if files:
             text = (text + "\n" if text else "") + " ".join("@" + p for p in files)
         reason = self._ready_to_type()
-        if reason is None:
+        if reason is None and not self._still_attached():
+            reason = "session"
+            with self.lock:
+                live = self._find()
+                if live:
+                    self._follow(live)
+        elif reason is None:
             with self.lock:
                 self.sent.append([text, time.time()])
             pasted = self._paste(text)
@@ -317,6 +324,12 @@ class LiveSession:
             reason = "tmux" if pasted is False else "draft"
         self.emit({"kind": "send_failed", "text": text, "reason": reason})
         return False
+
+    def _still_attached(self):
+        """The attached session still runs in our pane under the expected name. A /rename away, /clear or a restart
+        hands the pane or the name to another session; _watch only follows that within a second."""
+        cur = find_session(self.claude_dir, session_id=self.session_id, tmux_session=self.tmux_session)
+        return bool(cur) and cur["tmux"] == self.live["tmux"] and (not self.role or cur.get("name") == self.role)
 
     def interrupt(self):
         self._keys("Escape")
@@ -809,12 +822,7 @@ class LiveSession:
                 continue
             gone = False
             with self.lock:
-                switched = live["sessionId"] != self.live["sessionId"] or live["tmux"] != self.live["tmux"]
-                self.live = live
-                if switched:
-                    self._turn_end("done")
-                    self.emit({"kind": "session", "session_id": self.session_id, "pane": self.pane,
-                               "switched": True})
+                self._follow(live)
                 idle = live.get("status") == "idle" and self.turn is None
                 self.idle_since = (self.idle_since or time.time()) if idle else None
                 self._expire_sends(time.time())
@@ -822,6 +830,14 @@ class LiveSession:
                 if (self.turn is not None and live.get("status") == "idle" and not self.dialogs
                         and time.time() - self.last_line_at > 15):
                     self._turn_end("done")
+
+    def _follow(self, live):
+        """Attach to live (under the lock); another session or pane ends the open turn and is announced."""
+        switched = live["sessionId"] != self.live["sessionId"] or live["tmux"] != self.live["tmux"]
+        self.live = live
+        if switched:
+            self._turn_end("done")
+            self.emit({"kind": "session", "session_id": self.session_id, "pane": self.pane, "switched": True})
 
     def _expire_sends(self, now):
         """A sent text that never showed up as a prompt (lost keystrokes, a dialog ate it) is dropped from the queue

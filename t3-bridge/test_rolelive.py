@@ -35,12 +35,21 @@ def screen_file(name):
         return f.read()
 
 
+def write_session(claude_dir, d):
+    """sessions/<pid>.json as the CLI keeps it (pid must be alive)."""
+    os.makedirs(os.path.join(claude_dir, "sessions"), exist_ok=True)
+    with open(os.path.join(claude_dir, "sessions", f"{d['pid']}.json"), "w") as f:
+        json.dump(d, f)
+
+
 class Fake(rolelive.LiveSession):
     """A LiveSession whose pane is a string and whose key presses are recorded."""
 
     def __init__(self, claude_dir, screen=""):
         super().__init__(role="toy", claude_dir=claude_dir)
-        self.live = {"sessionId": "sid-1", "cwd": "/tmp/toy", "tmux": "test:@1.%1", "pid": 1, "status": "idle"}
+        self.live = {"sessionId": "sid-1", "cwd": "/tmp/toy", "tmux": "test:@1.%1", "pid": os.getpid(),
+                     "status": "idle", "name": "toy", "updatedAt": 1}
+        write_session(claude_dir, self.live)
         self.scr, self.keys, self.pasted, self.events = screen, [], [], []
         self.on_event = self.events.append
 
@@ -129,6 +138,27 @@ class Send(Base):
         self.s._entry(prompt("hello there"))
         self.assertTrue(self.s.events[-1]["by_us"])
         self.assertEqual(self.s.sent, [])
+
+    def test_send_refused_after_a_rename_and_the_namesake_followed(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        write_session(self.dir, {**self.s.live, "name": "elsewhere"})   # /rename in the attached session
+        other = {**self.s.live, "sessionId": "sid-2", "tmux": "test:@2.%2", "pid": os.getppid(), "updatedAt": 2}
+        write_session(self.dir, other)   # another session already carries the name
+        self.assertFalse(self.s.send("hello"))
+        self.assertEqual(self.s.pasted, [])
+        self.assertEqual(self.s.sent, [])
+        self.assertEqual(self.s.events[-2:], [
+            {"kind": "session", "session_id": "sid-2", "pane": "%2", "switched": True},
+            {"kind": "send_failed", "text": "hello", "reason": "session"}])
+        self.assertTrue(self.s.send("hello"))   # re-resolved: the next send goes to the session now named so
+        self.assertEqual(self.s.pasted, ["hello"])
+
+    def test_send_refused_when_the_session_moved_to_another_pane(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        write_session(self.dir, {**self.s.live, "tmux": "test:@3.%3"})
+        self.assertFalse(self.s.send("hello"))
+        self.assertEqual(self.s.pasted, [])
+        self.assertEqual(self.s.pane, "%3")
 
     def test_send_absorbed_mid_turn_is_ours_and_not_expired(self):
         # Pasted while a turn runs: no user entry, a queue-operation plus a queued_command attachment instead.

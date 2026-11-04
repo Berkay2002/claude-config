@@ -311,7 +311,8 @@ class Bridge:
 
     def send_failed(self, ev):
         why = {"draft": "someone has text typed in the tmux pane", "dialog": "a dialog is open in the session",
-               "timeout": "it never showed up in the session", "tmux": "tmux refused the keys"}.get(ev["reason"],
+               "timeout": "it never showed up in the session", "tmux": "tmux refused the keys",
+               "session": "the pane no longer runs the attached session under this role's name"}.get(ev["reason"],
                                                                                                     ev["reason"])
         self.notice(f"message not delivered ({why}); send it again: {ev['text'][:200]}")
         if self.turn is not None and self.turn["t3_uuid"] and not self.turn["landed"]:
