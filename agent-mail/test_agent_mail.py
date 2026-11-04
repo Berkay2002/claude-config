@@ -46,6 +46,9 @@ p({"type": "turn.completed"})
 """
 
 
+RELAY = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:3] + ['serve']))"
+
+
 def wait_for(cond, timeout=15):
     end = time.time() + timeout
     while time.time() < end:
@@ -59,9 +62,11 @@ def wait_for(cond, timeout=15):
 class Client:
     """A fake MCP client on a real stdio pipe to `agent_mail.py serve`."""
 
-    def __init__(self, env, cwd):
-        self.p = subprocess.Popen([sys.executable, AM, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  text=True, env=env, cwd=cwd)
+    def __init__(self, env, cwd, channel):
+        # channel: the server's parent carries Claude's dev-channels flag, as `claude-orch` does
+        argv = [sys.executable, "-c", RELAY, sys.executable, AM, "--dangerously-load-development-channels",
+                "server:agent-mail"] if channel else [sys.executable, AM, "serve"]
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env, cwd=cwd)
         self.resp, self.notes, self.n = queue.Queue(), queue.Queue(), 0
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -138,14 +143,14 @@ class Base(unittest.TestCase):
         os.environ.update(self.env0)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def client(self, name="orch", mail=True, **extra):
+    def client(self, name="orch", mail=True, channel=True, **extra):
         env = {k: v for k, v in os.environ.items() if k not in ("AGENT_MAIL_DIR", "AGENT_MAIL_NAME")}
         env.update(extra)
         if mail:
             env["AGENT_MAIL_DIR"] = self.mail
         if name:
             env["AGENT_MAIL_NAME"] = name
-        c = Client(env, self.cwd)
+        c = Client(env, self.cwd, channel)
         self.clients.append(c)
         return c
 
@@ -281,6 +286,15 @@ class ServerTests(Base):
         self.assertEqual([m["text"] for m in json.loads(text)], ["for codex"])
         self.assertEqual(json.loads(c.tool("inbox")[1]), [])
         self.assertEqual(json.loads(c.tool("list")[1])["unread"], 0)
+
+    def test_claude_without_the_channel_flag_gets_no_push(self):
+        """A Claude that would drop the push (no dev-channels flag, e.g. --bg) must not claim the mail."""
+        am.deliver(am.inbox_dir("orch"), "w1", "orch", "keep me")
+        c = self.client(channel=False)
+        c.init()
+        time.sleep(0.5)
+        self.assertTrue(c.notes.empty())
+        self.assertEqual([m["text"] for m in json.loads(c.tool("inbox")[1])], ["keep me"])
 
     def test_codex_start_and_send_over_stdio_with_real_runner(self):
         c = self.client()

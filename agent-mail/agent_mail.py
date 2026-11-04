@@ -232,6 +232,18 @@ TOOLS = {
 
 # ---------- MCP server ----------
 
+def parent_loads_channel():
+    """True when our parent (Claude starts stdio servers directly) was launched with the dev-channels flag for us.
+    Without it Claude drops channel pushes, so a pushed message would be claimed and lost: leave it for `inbox`."""
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
+            args = f.read().decode(errors="replace").split("\0")
+    except OSError:
+        return False
+    return (any(a.startswith("--dangerously-load-development-channels") for a in args)
+            and any("server:agent-mail" in a for a in args))
+
+
 class Server:
     def __init__(self, stdin=None, stdout=None):
         self.stdin, self.stdout = stdin or sys.stdin, stdout or sys.stdout
@@ -296,7 +308,7 @@ class Server:
     def handle(self, m):
         method, rid, p = m.get("method"), m.get("id"), m.get("params") or {}
         if method == "notifications/initialized":
-            if me() and self.client == "claude-code" and not self.poller:
+            if me() and self.client == "claude-code" and not self.poller and parent_loads_channel():
                 try:
                     root()
                 except MailError:
