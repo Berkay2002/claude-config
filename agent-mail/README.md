@@ -12,7 +12,8 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `send(to, text)` | `to` is a Codex worker: the text is queued (and its runner started when you own it). Any other name: written to that inbox. |
 | `codex_start(name, cwd, prompt, model?, effort?, sandbox?)` | Starts a Codex worker. Returns at once; the thread id and every turn result arrive as mail from the worker. |
 | `retire(name, force?, delete_thread?)` | Deletes a finished worker's record, queue and logs (owner only; its empty lock files stay and are reused). Refused while a turn runs ("retry after its turn_end") and while `queue/` or `taken/` holds mail, unless `force`. The Codex thread is kept unless `delete_thread` (then `codex delete --force` runs after the state is gone; a failed delete is reported, the worker is still retired). |
-| `list()` | Workers (state, thread id, cwd, last message's first line), this inbox's unread count, and `codex_usage`: the ChatGPT plan and Codex's 5-hour and weekly use with reset times, from the newest `$CODEX_HOME/sessions` log (a window that has reset since shows 0; `null` before any Codex turn). |
+| `list()` | Workers (state, thread id, cwd, last message's first line) and this inbox's unread count. |
+| `codex_usage()` | Codex's live quota from `codex app-server` (`account/rateLimits/read`, about 1.5 s): plan, 5-hour and weekly percent with reset times, banked resets (each zeroes both windows) with expiry and whether they lapse before the weekly reset, `spare_week_percent_per_day` and `use_before_lapse_percent_per_day`. Read-only: it never spends a reset. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
 
 Mail kinds: `message`, `turn_end` (the worker's last message), `error` (nonzero exit, `turn.failed`, no last

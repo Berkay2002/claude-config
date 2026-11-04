@@ -7,7 +7,6 @@ AGENT_MAIL_CODEX (codex binary, default `codex` on PATH), CODEX_HOME (passed thr
 """
 import ctypes
 import fcntl
-import glob
 import json
 import os
 import re
@@ -298,34 +297,62 @@ def tool_list():
             recs.append({k: r.get(k) for k in ("name", "state", "thread_id", "cwd", "owner", "sandbox")}
                         | {"last": (r.get("last_message") or "").split("\n", 1)[0]})
     unread = count_files(inbox_dir(me())) if me() else None
-    return json.dumps({"workers": recs, "unread": unread, "codex_usage": codex_usage()})
+    return json.dumps({"workers": recs, "unread": unread})
 
 
-def codex_usage():
-    """Codex's own quota (ChatGPT plan) from the newest session log that records it, so an orchestrator can route by it.
-    None when unknown (no CODEX_HOME, no logs yet, or a log format this code doesn't know)."""
-    home = os.environ.get("CODEX_HOME")
-    logs = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")), reverse=True) if home else []
-    for path in logs[:5]:  # names sort by start time; the newest few are enough
-        try:
-            with open(path, "rb") as f:
-                f.seek(max(0, os.path.getsize(path) - 512 * 1024))
-                tail = f.read().decode(errors="replace")
-            hits = list(re.finditer(r'"rate_limits"\s*:\s*', tail))
-            lim, _ = json.JSONDecoder().raw_decode(tail, hits[-1].end())
-        except (OSError, ValueError, IndexError):
-            continue
-        out = {"plan": lim.get("plan_type"),
-               "as_of": datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat(timespec="seconds")}
-        for w in (lim.get("primary"), lim.get("secondary")):
-            if isinstance(w, dict) and w.get("window_minutes") in (300, 10080):
-                key = "five_hour" if w["window_minutes"] == 300 else "week"
-                past = isinstance(w.get("resets_at"), (int, float)) and w["resets_at"] < time.time()
-                out[key + "_percent"] = 0.0 if past else w.get("used_percent")  # the window reset since that log
-                if w.get("resets_at"):
-                    out[key + "_resets"] = datetime.fromtimestamp(w["resets_at"], timezone.utc).isoformat(timespec="seconds")
-        return out
-    return None
+def tool_codex_usage():
+    """Codex's quota on the ChatGPT plan, live from `codex app-server` (account/rateLimits/read): 5-hour and weekly use,
+    banked resets (each one zeroes both windows) and the spare weekly percent per day they add up to. Read-only."""
+    p = subprocess.Popen([os.environ.get("AGENT_MAIL_CODEX") or "codex", "app-server"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    try:
+        def call(i, method, params=None):
+            p.stdin.write(json.dumps({"id": i, "method": method, "params": params or {}}) + "\n")
+            p.stdin.flush()
+        timer = threading.Timer(30, p.kill)  # a hung app-server must not hang the tool
+        timer.start()
+        call(1, "initialize", {"clientInfo": {"name": "agent-mail", "version": "1"}})
+        p.stdin.write(json.dumps({"method": "initialized"}) + "\n")
+        call(2, "account/rateLimits/read")
+        res = None
+        for line in p.stdout:
+            m = json.loads(line)
+            if m.get("id") == 2:
+                res = m
+                break
+        timer.cancel()
+    except (OSError, ValueError) as e:
+        raise MailError(f"codex app-server failed: {e}") from None
+    finally:
+        p.kill()
+        p.wait()
+    if not res or "result" not in res:
+        raise MailError(f"codex app-server gave no rate limits: {(res or {}).get('error', 'no answer in 30 s')}")
+    r, now = res["result"], time.time()
+    lim = r.get("rateLimits") or {}
+
+    def iso(t):
+        return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds") if t else None
+
+    def window(w):
+        w = w or {}
+        return {"percent": w.get("usedPercent"), "resets": iso(w.get("resetsAt")),
+                "days_left": round((w["resetsAt"] - now) / 86400, 2) if w.get("resetsAt") else None}
+    five, week = window(lim.get("primary")), window(lim.get("secondary"))
+    week_at = (lim.get("secondary") or {}).get("resetsAt")
+    banked = sorted(({"expires": iso(c.get("expiresAt")), "days_left": round((c["expiresAt"] - now) / 86400, 2),
+                      "before_week_reset": bool(week_at) and c["expiresAt"] < week_at}
+                     for c in (r.get("rateLimitResetCredits") or {}).get("credits") or []
+                     if c.get("status") == "available" and c.get("expiresAt")), key=lambda c: c["days_left"])
+    left = None if week["percent"] is None else 100 - week["percent"]
+    spare = round(left / max(week["days_left"], 0.1), 1) if left is not None and week["days_left"] else None
+    # A reset that lapses before the weekly reset is only worth something if the week is used up before it lapses.
+    lapse = next((c for c in banked if c["before_week_reset"]), None)
+    burn = round(left / max(lapse["days_left"], 0.1), 1) if lapse and left is not None else None
+    return json.dumps({"plan": lim.get("planType"), "usable": r.get("ordinaryUsageAllowed"),
+                       "limit_reached": lim.get("rateLimitReachedType"), "five_hour": five, "week": week,
+                       "banked_resets": banked, "spare_week_percent_per_day": spare,
+                       "use_before_lapse_percent_per_day": burn})
 
 
 def tool_inbox():
@@ -346,7 +373,9 @@ TOOLS = {
     "retire": (tool_retire, "Remove a Codex worker's state (record, queue, logs) once it is finished. Only its "
                "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept unless delete_thread.",
                {"name": {"type": "string"}, "force": {"type": "boolean"}, "delete_thread": {"type": "boolean"}}, ["name"]),
-    "list": (tool_list, "List Codex workers, this inbox's unread count and Codex's 5-hour/weekly quota use.", {}, []),
+    "list": (tool_list, "List Codex workers and this inbox's unread count.", {}, []),
+    "codex_usage": (tool_codex_usage, "Codex's live quota: 5-hour and weekly use, banked resets with expiry, spare weekly "
+                    "percent per day. Check it before starting Codex workers.", {}, []),
     "inbox": (tool_inbox, "Claim and return this instance's unread mail.", {}, []),
 }
 

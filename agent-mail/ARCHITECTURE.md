@@ -23,15 +23,14 @@ flowchart TB
         WR["workers/&lt;name&gt;<br/>record, queue, taken, logs"]
         IB["inbox/&lt;name&gt;<br/>new → cur"]
     end
-    SL[("CODEX_HOME sessions<br/>rate_limits, plan")]
+    AS["codex app-server<br/>account/rateLimits/read"]
     S1 -->|"spawn runner"| R
     S1 -->|"queue mail"| WR
     S1 -->|"claim mail (1 s poll)"| IB
-    S1 -.->|"list: codex_usage"| SL
+    S1 -.->|"codex_usage"| AS
     R -->|"claim queue → taken"| WR
     R -->|"turn_end / error"| IB
     S2 -->|"send"| IB
-    X -->|"session log"| SL
 ```
 
 - **`serve`**: the MCP server, one per session. Claude talks to it over stdio. In a Codex turn it is injected with
@@ -39,8 +38,9 @@ flowchart TB
 - **`run <name>`**: the runner. It starts in its own session, so a Claude restart or `/mcp` reconnect never kills a
   turn. An `flock` makes sure only one runs per worker, and it exits when the queue is empty.
 - **Mail folder**: all state. If any process dies, the files still say what is queued, running and delivered.
-- **Codex quota**: `list` reads the last `rate_limits` from the newest Codex session log (ChatGPT plan, 5-hour and
-  weekly percent, reset times; a window that has reset since shows 0), so the orchestrator can route by it.
+- **Codex quota**: the `codex_usage` tool starts a short-lived `codex app-server` and reads `account/rateLimits/read`:
+  ChatGPT plan, 5-hour and weekly percent, reset times, and banked resets (each zeroes both windows) with their expiry.
+  It never spends a reset.
 
 ## When an orchestrator picks a Codex worker
 
@@ -61,9 +61,15 @@ flowchart TD
 | `codex_usage` | Effect |
 |---|---|
 | Weekly above 75% | One rung down, no parallel Codex pieces |
-| Weekly or 5-hour above 90% | No new Codex worker unless the user asks |
-| Weekly ≤ 60%, reset ≤ 2 days away, spare ≥ 28%/day | Boost +1 rung (sol@medium → sol@high), one extra parallel piece |
-| Missing (no Codex turn yet) | Normal budget, no boost |
+| 5-hour above 90% | No new Codex work until `five_hour.resets` |
+| Weekly above 90% | No new Codex worker unless the user asks or spends a banked reset |
+| Weekly ≤ 60% and (weekly reset ≤ 2 days with spare ≥ 28%/day, or `use_before_lapse` ≥ 28%/day) | +1 rung (sol@medium → sol@high), up to three Codex workers |
+| Same, above 40%/day (more than one full 5-hour window a day) | Up to four Codex workers |
+| Work waiting and weekly above 90%, or 5-hour full and weekly above 50%, or a reset expires within 24 h and weekly above 40% | Suggest spending a banked reset (earliest expiry first); only the user spends it |
+
+One full 5-hour window is roughly 40% of a week (the user's estimate: a couple of windows fill it), so the 5-hour
+limit caps how fast Codex can use quota and the weekly one how much. A banked reset that expires before the weekly
+reset is only worth something if the week is used up first: `use_before_lapse_percent_per_day` is that pace.
 
 `gpt-6-astra` only when the user asks; `xhigh`, `max` and `ultra` only with their OK.
 

@@ -21,7 +21,7 @@ Same rules as step 3 of SKILL.md (goal, files, test that proves it, report forma
 ## 2. Launch
 `codex_start(name="<repo>-<piece>", cwd="<worktree>", prompt="<brief or path to it>", model="gpt-6.1-sol", effort="medium")`.
 Model, effort and when to use Codex at all: "Codex workers" in the shared CLAUDE.md. Always pass both, and check
-`list` → `codex_usage` (the Codex quota) before launching. `sandbox` stays unset unless the user wants a restricted worker (`read-only`,
+`codex_usage` (the Codex quota and banked resets) before launching. `sandbox` stays unset unless the user wants a restricted worker (`read-only`,
 `workspace-write`). It returns at once. You then get mail from the worker: `message` (thread id), then `turn_end` or
 `error` after each turn. A `claude/channel` push shows as `← agent-mail: …`.
 

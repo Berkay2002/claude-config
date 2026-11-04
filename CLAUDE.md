@@ -132,13 +132,21 @@ Model and effort, always passed to `codex_start` (never the `config.toml` defaul
 never without my OK. No Luna, Terra or older models: reading and mechanical edits stay with Haiku scouts.
 Routing line as for Claude workers, e.g. "→ codex gpt-6.1-sol@high: second-opinion review of …".
 
-Codex quota, the same idea as the Claude budget and boost above. agent-mail `list` returns `codex_usage`: plan,
-5-hour and weekly percent, reset times. It comes from the newest Codex session log, so it lags until a Codex turn ran;
-missing means a normal budget and no boost.
-- Weekly above 75%: drop one rung and start no parallel Codex pieces. Weekly or 5-hour above 90%: no new Codex worker
-  unless I ask.
-- Boost: weekly used ≤ 60%, reset ≤ 2 days away and spare ≥ 28%/day (spare = (100 − used%) ÷ days to reset): +1 rung
-  (sol@medium → sol@high), and Codex may take an extra parallel piece. A boost never goes past sol@high or to Astra.
+Codex quota, the same idea as the Claude budget and boost above, read live: agent-mail's `codex_usage` tool gives the
+plan, 5-hour and weekly percent with reset times, the banked resets (each one zeroes both windows) with their expiry,
+`spare_week_percent_per_day` ((100 − weekly %) ÷ days to the weekly reset) and `use_before_lapse_percent_per_day` (the
+same, up to the first banked reset that expires before the weekly reset; null when none does). Call it before each
+Codex launch. One full 5-hour window is roughly 40% of a week (a couple of windows fill it): the 5-hour limit caps how
+fast Codex can use quota, the weekly one how much.
+- Budget: weekly above 75%: drop one rung, no parallel Codex pieces. 5-hour above 90%: no new Codex work until
+  `five_hour.resets`. Weekly above 90%: no new Codex worker unless I ask or I spend a banked reset.
+- Boost (weekly ≤ 60%): +1 rung (sol@medium → sol@high) and up to three Codex workers when the weekly reset is ≤ 2 days
+  away with spare ≥ 28%/day, or when `use_before_lapse` is ≥ 28%/day (a banked reset expires before the week would be
+  used up, so quota spent on Codex now is what makes that reset worth using). Above 40%/day (more than one full 5-hour
+  window a day): up to four. A boost never goes past sol@high or to Astra.
+- Banked resets are mine to spend; agent-mail never spends one. Suggest it (earliest expiry first) when Codex work is
+  waiting and weekly is above 90%, or the 5-hour window is full and weekly is above 50%, or a reset expires within
+  24 hours and weekly is above 40%.
 
 # Git
 - Never add `Co-Authored-By: Claude …` or `Claude-Session: …` trailers to commits, and no "Generated with Claude Code" line in PRs.

@@ -25,6 +25,17 @@ FAKE = """#!/usr/bin/env python3.11
 import json, os, sys, time
 d = os.environ["FAKE_DIR"]
 a = sys.argv[1:]
+if a[:1] == ["app-server"]:
+    for line in sys.stdin:
+        m = json.loads(line)
+        if m.get("id") == 1:
+            p_ = {"id": 1, "result": {}}
+        elif m.get("id") == 2:
+            p_ = json.load(open(d + "/ratelimits.json"))
+        else:
+            continue
+        print(json.dumps(p_), flush=True)
+    sys.exit(0)
 if a[:1] == ["delete"]:
     with open(d + "/calls.jsonl", "a") as f:
         f.write(json.dumps({"argv": a}) + "\\n")
@@ -210,7 +221,7 @@ class ServerTests(Base):
         c.notify("notifications/whatever")  # unknown notification: ignored, no reply
         self.assertEqual(c.req("ping")["result"], {})
         names = {t["name"] for t in c.req("tools/list")["result"]["tools"]}
-        self.assertEqual(names, {"send", "codex_start", "retire", "list", "inbox"})
+        self.assertEqual(names, {"send", "codex_start", "retire", "list", "codex_usage", "inbox"})
         self.assertEqual(c.req("nope")["error"]["code"], -32601)
         err, text = c.tool("send", to="x", text="hi")
         self.assertFalse(err)
@@ -740,25 +751,33 @@ class RunnerTests(Base):
             self.assertEqual(am._drain("w1", lk, None), "done")
         self.assertIsNone(am.read_worker("w1"))
 
-    def test_list_reports_codex_quota_from_the_newest_session_log(self):
-        """codex_usage reads the last rate_limits of the newest rollout; a window that already reset counts as 0."""
-        self.assertIsNone(json.loads(am.tool_list())["codex_usage"])  # no logs yet
-        day = os.path.join(os.environ["CODEX_HOME"], "sessions", "2026", "11", "04")
-        os.makedirs(day)
-        later = int(time.time()) + 3600
+    def test_codex_usage_reads_live_limits_and_banked_resets(self):
+        """codex_usage asks the app-server; resets are sorted, flagged when they lapse before the weekly reset."""
+        now = int(time.time())
+        day = 86400
 
-        def log(name, five, week, five_reset):
-            ev = {"type": "token_count", "rate_limits": {"primary": {"used_percent": five, "window_minutes": 300,
-                  "resets_at": five_reset}, "secondary": {"used_percent": week, "window_minutes": 10080,
-                  "resets_at": later}, "plan_type": "plus"}}
-            with open(os.path.join(day, name), "w") as f:
-                f.write(json.dumps({"type": "other"}) + "\n" + json.dumps(ev) + "\n")
-        log("rollout-2026-11-04T09-00-00-a.jsonl", 90.0, 80.0, later)
-        log("rollout-2026-11-04T10-00-00-b.jsonl", 40.0, 12.5, int(time.time()) - 60)
-        u = json.loads(am.tool_list())["codex_usage"]
-        self.assertEqual((u["five_hour_percent"], u["week_percent"]), (0.0, 12.5))
-        self.assertIn("week_resets", u)
-        self.assertEqual(u["plan"], "plus")
+        def limits(week_used, credits):
+            return {"id": 2, "result": {"ordinaryUsageAllowed": True, "rateLimits": {
+                "planType": "plus", "rateLimitReachedType": None,
+                "primary": {"usedPercent": 30, "windowDurationMins": 300, "resetsAt": now + 3600},
+                "secondary": {"usedPercent": week_used, "windowDurationMins": 10080, "resetsAt": now + 4 * day}},
+                "rateLimitResetCredits": {"availableCount": len(credits), "credits": credits}}}
+        credits = [{"status": "available", "expiresAt": now + 20 * day}, {"status": "used", "expiresAt": now + day},
+                   {"status": "available", "expiresAt": now + 2 * day}]
+        with open(os.path.join(self.tmp, "ratelimits.json"), "w") as f:
+            json.dump(limits(60, credits), f)
+        u = json.loads(am.tool_codex_usage())
+        self.assertEqual((u["plan"], u["five_hour"]["percent"], u["week"]["percent"]), ("plus", 30, 60))
+        self.assertEqual([c["before_week_reset"] for c in u["banked_resets"]], [True, False])  # used one dropped
+        self.assertAlmostEqual(u["spare_week_percent_per_day"], 10.0, delta=0.2)  # 40 left over 4 days
+        self.assertAlmostEqual(u["use_before_lapse_percent_per_day"], 20.0, delta=0.3)  # 40 left before day 2
+        with open(os.path.join(self.tmp, "ratelimits.json"), "w") as f:
+            json.dump(limits(60, credits[:1]), f)
+        self.assertIsNone(json.loads(am.tool_codex_usage())["use_before_lapse_percent_per_day"])
+        with open(os.path.join(self.tmp, "ratelimits.json"), "w") as f:
+            json.dump({"id": 2, "error": {"message": "not logged in"}}, f)
+        with self.assertRaisesRegex(am.MailError, "not logged in"):
+            am.tool_codex_usage()
 
     def test_retire_can_delete_the_codex_thread(self):
         """delete_thread runs `codex delete --force -- <id>`; a failed delete is reported and the worker is still gone."""
