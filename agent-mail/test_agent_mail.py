@@ -646,13 +646,13 @@ class RunnerTests(Base):
         return sorted(os.listdir(os.path.join(self.mail, "workers")))
 
     def test_retire_idle_worker_removes_everything_and_the_name_is_free_again(self):
-        """retire deletes record, both locks and folder; list forgets it; the thread id is in the answer."""
+        """retire deletes record and folder (lock files stay); list forgets it; the thread id is in the answer."""
         self.idle_worker()
         self.assertEqual(self.worker_files(), ["w1", "w1.json", "w1.lock", "w1.rec.lock"])
         out = am.tool_retire("w1")
         self.assertIn("thread-1", out)
         self.assertIn("codex delete --force thread-1", out)
-        self.assertEqual(self.worker_files(), [])
+        self.assertEqual(self.worker_files(), ["w1.lock", "w1.rec.lock"])
         self.assertEqual(json.loads(am.tool_list())["workers"], [])
         self.start_sync()  # same name again
         self.assertEqual(am.read_worker("w1")["state"], "starting")
@@ -686,7 +686,7 @@ class RunnerTests(Base):
             am.tool_retire("w1")
         self.assertIsNotNone(am.read_worker("w1"))
         self.assertIn("discarded 2", am.tool_retire("w1", force=True))
-        self.assertEqual(self.worker_files(), [])
+        self.assertEqual(self.worker_files(), ["w1.lock", "w1.rec.lock"])
 
     def test_retire_unknown_and_invalid_names(self):
         """Unknown worker: a clear error and nothing created; dotted or path-like names never reach the filesystem."""
@@ -696,6 +696,45 @@ class RunnerTests(Base):
             with self.assertRaises(am.MailError, msg=bad):
                 am.tool_retire(bad)
         self.assertFalse(os.path.exists(os.path.join(self.mail, "workers")))
+
+    def test_send_racing_retire_is_not_lost(self):
+        """A retire between send's first look and its queue write: the mail lands in the inbox, no phantom worker."""
+        self.idle_worker()
+        orig, raced = am.read_worker, []
+
+        def read_then_retire(name):
+            rec = orig(name)
+            if not raced:
+                raced.append(1)
+                am.tool_retire(name)
+            return rec
+        with mock.patch.object(am, "read_worker", side_effect=read_then_retire):
+            out = am.tool_send("w1", "late")
+        self.assertIn("delivered to inbox w1", out)
+        self.assertEqual(self.worker_files(), ["w1.lock", "w1.rec.lock"])
+        self.assertEqual([m["text"] for m in self.box("w1")], ["late"])
+
+    def test_a_runner_opened_before_retire_still_excludes_the_next_runner(self):
+        """Retire keeps the lock files, so a handle opened before it and one opened after share one lock."""
+        import fcntl
+        self.idle_worker()
+        with open(am.wdir("w1") + ".lock", "w") as old:
+            am.tool_retire("w1", force=True)
+            self.start_sync()
+            with open(am.wdir("w1") + ".lock", "w") as new:
+                fcntl.flock(new, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(old, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_runner_of_a_retired_worker_recreates_nothing(self):
+        """A runner that starts after retire exits without writing a record or files; one that waited on the lock too."""
+        self.assertEqual(am.run_worker("ghost"), "done")
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "workers")))
+        self.idle_worker()
+        with open(am.wdir("w1") + ".lock", "w") as lk:
+            os.unlink(am.wrec("w1"))  # retired while this runner waited
+            self.assertEqual(am._drain("w1", lk, None), "done")
+        self.assertIsNone(am.read_worker("w1"))
 
     def test_retire_over_stdio(self):
         """The tool is registered with a schema and answers errors as isError results."""

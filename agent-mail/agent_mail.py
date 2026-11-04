@@ -200,8 +200,13 @@ def tool_send(to, text):
     if not isinstance(text, str) or not text:
         raise MailError("text must be a non-empty string")
     rec = read_worker(check_name(to, "recipient"))
+    if rec is not None:  # queue under the record lock: a retire between our check and the write would drop the mail
+        with open(wdir(to) + ".rec.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            rec = read_worker(to)
+            if rec is not None:
+                deliver(os.path.join(wdir(to), "queue"), me(), to, text)
     if rec is not None:
-        deliver(os.path.join(wdir(to), "queue"), me(), to, text)
         if rec.get("owner") != (me() or "unknown"):
             return f"queued for Codex worker {to}; its owner {rec.get('owner')} starts its runner (when it runs)"
         spawn_runner(to)
@@ -240,7 +245,7 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
 
 
 def tool_retire(name, force=False):
-    """Delete a worker's record, locks and folder. Holding the runner lock means no turn is running (and none starts)."""
+    """Delete a worker's record and folder (its empty lock files stay, reused by a new worker). Holding the runner lock means no turn is running (and none starts)."""
     check_name(name, "worker name")
     owner = me() or "unknown"
 
@@ -266,8 +271,7 @@ def tool_retire(name, force=False):
                 raise MailError(f"worker {name} still has {pending} undelivered message(s); they would be lost: "
                                 "wait for its turn_end, or pass force=true to discard them")
             shutil.rmtree(wdir(name), ignore_errors=True)
-            for path in (wrec(name), wdir(name) + ".rec.lock", wdir(name) + ".lock"):
-                os.unlink(path)
+            os.unlink(wrec(name))  # the lock files stay: a runner holding an old handle must share the next one's lock
     tid = rec.get("thread_id")
     kept = f"thread {tid} is kept (`codex delete --force {tid}` removes it)" if tid else "thread id was never recorded"
     return f"retired worker {name}" + (f" (discarded {pending} message(s))" if pending else "") + f". Its Codex {kept}."
@@ -302,7 +306,7 @@ TOOLS = {
                     {"name": {"type": "string"}, "cwd": {"type": "string"}, "prompt": {"type": "string"},
                      "model": {"type": "string"}, "effort": {"type": "string"},
                      "sandbox": {"type": "string", "enum": list(SANDBOXES)}}, ["name", "cwd", "prompt"]),
-    "retire": (tool_retire, "Remove a Codex worker's state (record, locks, queue, logs) once it is finished. Only its "
+    "retire": (tool_retire, "Remove a Codex worker's state (record, queue, logs) once it is finished. Only its "
                "owner; refused while a turn runs or mail is undelivered (unless force). The Codex thread is kept.",
                {"name": {"type": "string"}, "force": {"type": "boolean"}}, ["name"]),
     "list": (tool_list, "List Codex workers and this inbox's unread count.", {}, []),
@@ -560,6 +564,8 @@ def _read_events(name, rec, p, jf, tid):
 
 def run_worker(name, _hook=None):
     """Drain the worker's queue turn by turn. Returns "locked" if another runner holds the worker, else "done"."""
+    if read_worker(name) is None:
+        return "done"  # retired (or never started): nothing to run
     os.makedirs(wdir(name), exist_ok=True)
     with open(wdir(name) + ".lock", "w") as lk:
         return _drain(name, lk, _hook)
@@ -571,6 +577,9 @@ def _drain(name, lk, _hook):
         fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return "locked"
+    if read_worker(name) is None:  # retired while we waited; update_worker below would recreate an ownerless record
+        # an empty folder (or logs/ from spawn_runner) may come back after retire: harmless, codex_start reuses it
+        return "done"
     queue, taken = os.path.join(wd, "queue"), os.path.join(wd, "taken")
     old = read_worker(name) or {}
     update_worker(name, pid=os.getpid())

@@ -123,7 +123,7 @@ $AGENT_MAIL_DIR/
 ├── inbox/<name>/cur/                 claimed
 └── workers/
     ├── <name>.json                   record: state, owner, thread_id, cwd, sandbox, pid, turns
-    ├── <name>.lock, <name>.rec.lock  runner lock, record lock
+    ├── <name>.lock, <name>.rec.lock  runner lock, record lock (kept by retire, reused)
     └── <name>/
         ├── queue/                    messages waiting for the next turn
         ├── taken/                    messages in the running turn
@@ -132,6 +132,6 @@ $AGENT_MAIL_DIR/
 
 ## Limits
 
-`retire` keeps the Codex thread (`codex delete --force <id>` removes it), sender names are self-declared, the push
+`retire` keeps the Codex thread (`codex delete --force <id>` removes it) and the empty lock files, sender names are self-declared, the push
 needs an interactive Claude with the development-channel flag (a `--bg` orchestrator polls `inbox`), and Kiro has no
 MCP channel, so it is not covered.

@@ -55,7 +55,7 @@ if (Test-Path $codexHome -PathType Container) {
   try {
     $item = Get-Item $codexRules -ErrorAction SilentlyContinue
     $src = Read-Utf8 (Join-Path $shared 'codex\AGENTS.md')
-    if (-not ($item -and $item.LinkType) -and -not ($item -and (Read-Utf8 $codexRules) -eq $src)) {
+    if (-not ($item -and $item.LinkType) -and -not ($item -and (Read-Utf8 $codexRules) -ceq $src)) {
       if ($item) { Copy-Item $codexRules (Join-Path $backups "codex-AGENTS.md.$stamp") }
       Write-Utf8 "$codexRules.tmp" $src; Move-Item -Force "$codexRules.tmp" $codexRules
     }
