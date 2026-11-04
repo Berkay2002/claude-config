@@ -64,7 +64,7 @@ def find_session(claude_dir, role=None, session_id=None, tmux_session=None):
     best = None
     for f in glob.glob(os.path.join(claude_dir, "sessions", "*.json")):
         try:
-            d = json.load(open(f))
+            d = read_json(f)
             os.kill(int(d["pid"]), 0)
         except Exception:
             continue
@@ -96,6 +96,11 @@ def input_line(screen):
     return None
 
 
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
 def strings(o):
     """Every string inside a JSON value."""
     if isinstance(o, str):
@@ -106,6 +111,17 @@ def strings(o):
     elif isinstance(o, list):
         for v in o:
             yield from strings(v)
+
+
+def permission_hint(d):
+    """What identifies a permission dialog on screen (whitespace removed): the command, the file name, the URL, or
+    the longest string the tool got. None when the input has nothing usable."""
+    inp = d.get("input") or {}
+    path = inp.get("file_path") or inp.get("notebook_path")
+    hint = (os.path.basename(path) if path else inp.get("command") or inp.get("url")
+            or max((v for v in inp.values() if isinstance(v, str)), key=len, default=""))
+    hint = re.sub(r"\s+", "", str(hint))[:200]   # shortcut: the TUI may shorten very long commands; 200 chars held
+    return hint or None
 
 
 def task_notification(text):
@@ -195,7 +211,7 @@ class LiveSession:
 
     def saved_offset(self):
         try:
-            d = json.load(open(self._state_path()))
+            d = read_json(self._state_path())
         except (OSError, ValueError):
             return None
         return d if self.state_key else None
@@ -357,18 +373,20 @@ class LiveSession:
         return True
 
     def _on_screen(self, d):
-        """The dialog d is what the pane shows now: never press keys into the wrong dialog."""
+        """The dialog d is what the pane shows now: never press keys into the wrong dialog. Fails closed: a permission
+        dialog needs an identifying hint from its input on screen, and no other open dialog may share that hint."""
         scr = self.screen()
         flat = " ".join(scr.split())
-        if d["dialog"] == "permission":
-            if not re.search(r"❯ 1\. Yes", scr):
-                return None
-            inp = d["input"]
-            hint = (os.path.basename(inp.get("file_path") or inp.get("notebook_path") or "")
-                    or " ".join(str(inp.get("command") or "").split())[:24])
-            return scr if not hint or hint in flat else None
-        qs = d["input"].get("questions") or [{}]
-        return scr if " ".join(str(qs[0].get("question", "")).split())[:40] in flat else None
+        if d["dialog"] == "question":
+            qs = d["input"].get("questions") or [{}]
+            return scr if " ".join(str(qs[0].get("question", "")).split())[:40] in flat else None
+        if not re.search(r"❯ 1\. Yes", scr):
+            return None
+        hint = permission_hint(d)
+        bare = re.sub(r"\s+", "", scr)   # the TUI wraps long commands and paths anywhere
+        with self.lock:
+            twins = [o for o in self.dialogs.values() if o is not d and permission_hint(o) == hint]
+        return scr if hint and hint in bare and not twins else None
 
     def answer(self, dialog_id, choice):
         """Answer an open dialog in the TUI. question: {question: label | "a, b" | free text}; permission: allow/deny."""
@@ -542,7 +560,7 @@ class LiveSession:
             if aid in self.agents:
                 continue
             try:
-                meta = json.load(open(m))
+                meta = read_json(m)
             except (OSError, ValueError):
                 continue   # still being written
             tid = meta.get("toolUseId")
@@ -561,7 +579,7 @@ class LiveSession:
             self._drain_agent(aid, a)
             if a["background"]:   # fallback when no task-notification reaches the transcript
                 try:
-                    finished = json.load(open(a["path"][:-len(".jsonl")] + ".meta.json")).get("finished")
+                    finished = read_json(a["path"][:-len(".jsonl")] + ".meta.json").get("finished")
                 except (OSError, ValueError):
                     finished = False
                 a.setdefault("finished_at", time.time()) if finished else a.pop("finished_at", None)
@@ -612,6 +630,8 @@ class LiveSession:
         if a.get("path"):
             self._drain_agent(aid, a)
         a["done"] = True
+        if a.get("f"):
+            a["f"].close()
         self.launches.pop(a["tool_use_id"], None)
         self.emit({"kind": "subagent_end", "id": aid, "tool_use_id": a["tool_use_id"], "status": status,
                    "summary": summary[:2000], **self._meta})
@@ -622,9 +642,11 @@ class LiveSession:
     def _tail_transcript(self, since):
         path, f, buf, pos, replay_end = None, None, b"", 0, 0
         first = True
-        while not self.stopped:
+        while not self.stopped or f and f.close():   # closes the file on the way out
             p = self.transcript_path()
             if p != path:
+                if f:
+                    f.close()
                 path, f, buf = p, None, b""
             if f is None and os.path.exists(p):
                 f = open(p, "rb")
