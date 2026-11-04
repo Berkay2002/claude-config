@@ -164,11 +164,14 @@ def runner_alive(name, pid):
 
 
 def revive_dead(owner):
-    """Start a runner for each busy worker of `owner` whose runner died; the new runner mails the owner an error."""
+    """Start a runner for each worker of `owner` that is busy or has queued mail but no live runner (a dead runner's
+    replacement mails the owner an error). Only the owner spawns runners, so each inherits the owner's full env."""
     wd = os.path.join(root(), "workers")
     for fn in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
         r = read_worker(fn[:-5]) if fn.endswith(".json") else None
-        if not r or r.get("state") not in BUSY or r.get("owner") != owner:
+        if not r or r.get("owner") != owner:
+            continue
+        if r.get("state") not in BUSY and not count_files(os.path.join(wdir(r["name"]), "queue")):
             continue
         if r.get("pid") is None:  # not started yet: give spawn_runner its moment
             age = datetime.now(timezone.utc) - datetime.fromisoformat(r.get("updated") or now_iso())
@@ -194,8 +197,11 @@ def spawn_runner(name):
 def tool_send(to, text):
     if not isinstance(text, str) or not text:
         raise MailError("text must be a non-empty string")
-    if read_worker(check_name(to, "recipient")) is not None:
+    rec = read_worker(check_name(to, "recipient"))
+    if rec is not None:
         deliver(os.path.join(wdir(to), "queue"), me(), to, text)
+        if rec.get("owner") != (me() or "unknown"):
+            return f"queued for Codex worker {to}; its owner {rec.get('owner')} starts its runner (when it runs)"
         spawn_runner(to)
         return f"queued for Codex worker {to}; its runner is started and the result will arrive as mail"
     deliver(inbox_dir(to), me(), to, text)
@@ -304,12 +310,13 @@ class Server:
         self.write({"jsonrpc": "2.0", "method": "notifications/claude/channel",
                     "params": {"content": msg.get("text", ""), "meta": meta}})
 
-    def poll(self, interval):
-        """Claim and push one message at a time; a push that fails goes back to new/ for the next reader."""
+    def poll(self, interval, push=True):
+        """Start runners for our workers' queued mail, and (push) claim and push our mail one message at a time; a
+        push that fails goes back to new/ for the next reader."""
         while not self.stop.is_set():
             try:
                 new = inbox_dir(me())
-                for path, m in claim(new, inbox_dir(me(), "cur")):
+                for path, m in claim(new, inbox_dir(me(), "cur")) if push else ():
                     try:
                         self.push(m)
                     except (OSError, ValueError):  # client gone (broken pipe, closed stdout)
@@ -344,13 +351,14 @@ class Server:
     def handle(self, m):
         method, rid, p = m.get("method"), m.get("id"), m.get("params") or {}
         if method == "notifications/initialized":
-            if me() and self.client == "claude-code" and not self.poller and parent_loads_channel():
+            if me() and not self.poller:
                 try:
                     root()
                 except MailError:
                     return
-                self.poller = threading.Thread(target=self.poll, args=(float(os.environ.get("AGENT_MAIL_POLL", 1)),),
-                                               daemon=True)
+                push = self.client == "claude-code" and parent_loads_channel()
+                self.poller = threading.Thread(target=self.poll, daemon=True,
+                                               args=(float(os.environ.get("AGENT_MAIL_POLL", 1)), push))
                 self.poller.start()
             return
         if rid is None:

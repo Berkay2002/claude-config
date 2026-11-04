@@ -30,7 +30,8 @@ last, prompt = a[a.index("-o") + 1], a[-1]
 tid = a[-2] if resume else None
 with open(d + "/calls.jsonl", "a") as f:
     f.write(json.dumps({"argv": a, "cwd": os.getcwd(), "stdin": os.readlink("/proc/self/fd/0"),
-                        "name": os.environ.get("AGENT_MAIL_NAME"), "pid": os.getpid()}) + "\\n")
+                        "name": os.environ.get("AGENT_MAIL_NAME"), "pid": os.getpid(),
+                        "owner_only": os.environ.get("OWNER_ONLY")}) + "\\n")
 def p(o): print(json.dumps(o), flush=True)
 if os.path.exists(d + "/otherid") and resume:
     p({"type": "thread.started", "thread_id": "resume-other"})
@@ -310,6 +311,23 @@ class ServerTests(Base):
         self.assertEqual([m["text"] for m in json.loads(text)], ["for codex"])
         self.assertEqual(json.loads(c.tool("inbox")[1]), [])
         self.assertEqual(json.loads(c.tool("list")[1])["unread"], 0)
+
+    def test_only_the_owner_starts_runners_so_they_get_its_env(self):
+        """A non-owner's send only queues; the owner's poll thread starts the runner, with the owner's environment."""
+        owner = self.client(channel=False, OWNER_ONLY="1")
+        owner.init(client="codex-mcp-client")
+        self.assertFalse(owner.tool("codex_start", name="w1", cwd=self.cwd, prompt="first")[0])
+        wait_for(lambda: [m for m in self.box() if m["kind"] == "turn_end"])
+        bob = self.client(name="bob", channel=False)
+        bob.init(client="codex-mcp-client")
+        with mock.patch.object(am, "spawn_runner") as sp:  # in-process sends by a non-owner: no spawn either
+            os.environ["AGENT_MAIL_NAME"] = "bob"
+            self.assertIn("its owner orch starts", am.tool_send("w1", "x"))
+            json.loads(am.tool_list()), json.loads(am.tool_inbox())
+        sp.assert_not_called()
+        wait_for(lambda: len([m for m in self.box() if m["kind"] == "turn_end"]) == 2)  # the owner ran it
+        self.assertIn("From bob:\nx", self.calls()[1]["argv"][-1])
+        self.assertEqual(self.calls()[1]["owner_only"], "1")  # the runner came from the owner's server
 
     def test_claude_without_the_channel_flag_gets_no_push(self):
         """A Claude that would drop the push (no dev-channels flag, e.g. --bg) must not claim the mail."""

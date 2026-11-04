@@ -8,7 +8,7 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 
 | Tool | What it does |
 |---|---|
-| `send(to, text)` | `to` is a Codex worker: the text is queued and its runner started. Any other name: written to that inbox. |
+| `send(to, text)` | `to` is a Codex worker: the text is queued (and its runner started when you own it). Any other name: written to that inbox. |
 | `codex_start(name, cwd, prompt, model?, effort?, sandbox?)` | Starts a Codex worker. Returns at once; the thread id and every turn result arrive as mail from the worker. |
 | `list()` | Workers (state, thread id, cwd, last message's first line) and this inbox's unread count. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
@@ -69,7 +69,10 @@ alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" 
 - Workers: `workers/<name>.json` (state `starting | running | idle | failed`), `workers/<name>/queue/`, logs per turn
   in `workers/<name>/logs/`. A detached runner (`agent_mail.py run <name>`, one at a time per worker via `flock`)
   runs `codex exec --json`, later turns `codex exec resume <thread_id>`, several queued messages joined into one
-  turn, each prefixed `From <sender>:`. It exits when the queue is empty; `send` starts it again.
+  turn, each prefixed `From <sender>:`. It exits when the queue is empty. Only the worker's owner starts runners
+  (its `send`, or its agent-mail instance noticing queued mail within a second), so every turn runs with the owner's
+  full environment (proxies, `UV_*`, `LOG_PATH`), never Codex's filtered one. Trade-off: while the owner's session is
+  down, mail to its workers waits in the queue until it is back.
 - A runner that dies mid-turn takes its codex with it. The owner's push thread, `list` or `inbox` notices the dead
   runner and starts a new one, which mails the owner an `error` and runs the interrupted messages again. A turn is
   delivered at least once: a crash in the instant between mailing the result and clearing the turn replays it.
