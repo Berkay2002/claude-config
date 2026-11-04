@@ -271,6 +271,20 @@ class ServerTests(Base):
         self.assertEqual(am.count_files(am.inbox_dir("orch")), 3)
         self.assertEqual(am.count_files(am.inbox_dir("orch", "cur")), 0)
 
+    def test_poller_survives_an_unexpected_error(self):
+        """One failing round (here a broken worker record) must not stop push for the rest of the session."""
+        srv = am.Server(stdin=[], stdout=mock.Mock())
+        calls = []
+
+        def revive(owner):
+            calls.append(owner)
+            if len(calls) == 1:
+                raise KeyError("name")
+            srv.stop.set()
+        with mock.patch.object(am, "revive_dead", side_effect=revive), mock.patch("traceback.print_exc"):
+            srv.poll(0.01)
+        self.assertEqual(calls, ["orch", "orch"])
+
     def test_claim_race_between_threads(self):
         for i in range(60):
             am.deliver(am.inbox_dir("orch"), "bob", "orch", f"m{i}")

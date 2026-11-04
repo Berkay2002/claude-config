@@ -316,8 +316,8 @@ class Server:
                     if self.stop.is_set():
                         return
                 revive_dead(me())
-            except (MailError, OSError, ValueError):
-                pass
+            except Exception:  # a bad file or a bug must not end push for the rest of the session
+                traceback.print_exc()
             self.stop.wait(interval)
 
     def initialize(self, p):
