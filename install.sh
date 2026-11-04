@@ -39,6 +39,9 @@ fi
 link() { [ -L "$2" ] && return; [ -e "$2" ] && mv "$2" "$backups/$(basename "$2").$stamp"; ln -s "$1" "$2"; }
 link "$shared/agents" "$claude/agents"
 for d in "$shared"/skills/*/; do d="${d%/}"; link "$d" "$claude/skills/$(basename "$d")"; done
+# Codex reads its global rules from $CODEX_HOME/AGENTS.md; linked only where Codex is set up.
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+if [ -d "$codex_home" ]; then link "$shared/codex/AGENTS.md" "$codex_home/AGENTS.md"; fi
 
 # 3. Plugins: register and update marketplaces, then install missing user-scope plugins named in settings.shared.json. Failures are printed to stderr and keep the marker back.
 failed=0

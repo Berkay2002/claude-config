@@ -16,6 +16,7 @@ https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 | `skills/orchestrate` | Run a feature as parallel background sessions in git worktrees, coordinated from one session |
 | `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (daily `--auto` for the safe part) |
 | `settings.shared.json` | Settings merged into `~/.claude/settings.json` on every device (your other keys stay) |
+| `codex/AGENTS.md` | The same rules for Codex CLI (attribution, git, worktrees, worker conduct), linked to `$CODEX_HOME/AGENTS.md` |
 | `install.sh`, `install.ps1` | Installers for macOS/Linux and Windows |
 
 It works best with the [berkays-mods](https://github.com/Berkay2002/berkays-mods) plugins, which the shared settings

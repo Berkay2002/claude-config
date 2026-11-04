@@ -48,6 +48,7 @@ for Opus workers, and drop it if this machine rejects the flag (the advisor is e
 (Verified 2026-09-27: `--bg` + `--worktree` works; worktree at `.claude/worktrees/<name>`, branch `worktree-<name>`, locked while running.
 If it misbehaves, fall back to `git worktree add ../<repo>-worktrees/<name> -b feat/<name>`,
 trust the folder in `~/.claude.json` `projects.<path>.hasTrustDialogAccepted`, and launch there.)
+Codex workers instead: [codex-workers.md](codex-workers.md) (start, message and retire them through agent-mail).
 Check with `claude agents --json`. Then subscribe once per worker:
 `SendMessage({to: "<repo>-<name>", message: "", notify_when_idle: true})`. Never poll.
 

@@ -2,7 +2,8 @@
 
 One stdio MCP server (`agent_mail.py`, Python 3.11 stdlib, one file) that Claude Code and Codex CLI both load. A Claude
 orchestrator uses it to start Codex workers, message them by name, and be woken by their messages and turn results,
-the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod, no hooks, no Monitor.
+the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod, no hooks, no Monitor. Diagrams:
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Tools
 
