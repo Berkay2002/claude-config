@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # no dots: `x.rec` would collide with x's lock files
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
 SANDBOXES = ("full", "workspace-write", "read-only")  # loosest to tightest
 LIVE = ("starting", "running", "idle")
@@ -39,12 +39,13 @@ def root():
 
 
 def me():
-    return os.environ.get("AGENT_MAIL_NAME") or ""
+    n = os.environ.get("AGENT_MAIL_NAME") or ""
+    return check_name(n, "AGENT_MAIL_NAME") if n else ""
 
 
 def check_name(n, what="name"):
     if not isinstance(n, str) or not NAME_RE.match(n):
-        raise MailError(f"invalid {what} {n!r}: use letters, digits, . _ - (max 64, no leading symbol)")
+        raise MailError(f"invalid {what} {n!r}: use letters, digits, _ - (max 64, no leading symbol)")
     return n
 
 
@@ -80,14 +81,14 @@ def inbox_dir(name, sub="new"):
     return os.path.join(root(), "inbox", check_name(name, "recipient"), sub)
 
 
-def take(src, dst):
-    """Claim every file in src by renaming it into dst (exactly-once even with several readers); returns messages."""
+def claim(src, dst):
+    """Yield (path in dst, message) for each file in src, claimed by renaming it into dst only when the caller asks for
+    the next one (exactly-once even with several readers)."""
     try:
         names = sorted(os.listdir(src))
     except FileNotFoundError:
-        return []
+        return
     os.makedirs(dst, exist_ok=True)
-    out = []
     for n in names:
         if not n.endswith(".json"):
             continue
@@ -97,10 +98,13 @@ def take(src, dst):
             continue  # another reader claimed it
         try:
             with open(os.path.join(dst, n)) as f:
-                out.append(json.load(f))
+                yield os.path.join(dst, n), json.load(f)
         except (OSError, ValueError):
             pass  # corrupt file stays in dst, not delivered
-    return out
+
+
+def take(src, dst):
+    return [m for _, m in claim(src, dst)]
 
 
 def claim_inbox(name):

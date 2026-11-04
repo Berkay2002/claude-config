@@ -439,6 +439,17 @@ class RunnerTests(Base):
             self.start_sync()  # live name refused
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
 
+    def test_dotted_names_and_bad_own_name_are_refused(self):
+        """Dots would let `x.rec` share x's lock files; a bad AGENT_MAIL_NAME must fail loudly, not silently."""
+        for bad in ("x.rec", "a.json"):
+            with self.assertRaises(am.MailError, msg=bad):
+                self.start_sync(bad)
+        os.environ["AGENT_MAIL_NAME"] = "../orch"
+        with self.assertRaisesRegex(am.MailError, "AGENT_MAIL_NAME"):
+            am.tool_send("y", "t")
+        with self.assertRaisesRegex(am.MailError, "AGENT_MAIL_NAME"):
+            am.tool_inbox()
+
     def test_failed_worker_can_be_restarted_without_replaying_old_mail(self):
         self.start_sync(prompt="old")
         self.flag("fail")
