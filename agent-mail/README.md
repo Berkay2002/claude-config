@@ -70,7 +70,7 @@ alias codex-mail='codex -c mcp_servers.agent-mail.command="/usr/bin/python3.11" 
   in `workers/<name>/logs/`. A detached runner (`agent_mail.py run <name>`, one at a time per worker via `flock`)
   runs `codex exec --json`, later turns `codex exec resume <thread_id>`, several queued messages joined into one
   turn, each prefixed `From <sender>:`. It exits when the queue is empty; `send` starts it again.
-- A runner that dies mid-turn takes its codex with it. The owner's push thread (and any `list`) notices the dead
+- A runner that dies mid-turn takes its codex with it. The owner's push thread, `list` or `inbox` notices the dead
   runner and starts a new one, which mails the owner an `error` and runs the interrupted messages again. A turn is
   delivered at least once: a crash in the instant between mailing the result and clearing the turn replays it.
 - Every turn re-injects the agent-mail server with `-c mcp_servers.agent-mail.*` (command, args, name, dir, plus

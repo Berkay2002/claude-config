@@ -530,13 +530,20 @@ class RunnerTests(Base):
         """A live runner or a record still inside its start grace is left alone."""
         self.start_sync()
         with mock.patch.object(am, "spawn_runner") as sp:
-            am.revive_dead()  # starting, pid None, fresh: grace
+            am.revive_dead("orch")  # starting, pid None, fresh: grace
             am.update_worker("w1", state="running", pid=os.getpid())
-            am.revive_dead()  # the pid is alive but is not `agent_mail.py run w1`: pid reuse, so it is dead
+            am.revive_dead("orch")  # the pid is alive but is not `agent_mail.py run w1`: pid reuse, so it is dead
             self.assertEqual(sp.call_count, 1)
+            am.revive_dead("bob")  # someone else's worker: not ours to revive
+            os.environ["AGENT_MAIL_NAME"] = "bob"
+            am.tool_list()
+            self.assertEqual(sp.call_count, 1)
+            os.environ["AGENT_MAIL_NAME"] = "orch"
+            am.tool_inbox()  # owners without push poll with inbox: it revives too
+            self.assertEqual(sp.call_count, 2)
             am.update_worker("w1", state="idle", pid=None)
-            am.revive_dead()
-            self.assertEqual(sp.call_count, 1)
+            am.revive_dead("orch")
+            self.assertEqual(sp.call_count, 2)
 
     def test_a_runner_bug_ends_the_turn_with_an_error(self):
         """Any exception inside a turn becomes an error event and state failed, not a silent `running`."""

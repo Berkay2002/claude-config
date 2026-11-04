@@ -163,12 +163,12 @@ def runner_alive(name, pid):
     return b"run" in args and name.encode() in args
 
 
-def revive_dead(owner=None):
-    """Start a runner for every busy worker (of `owner`, or all) whose runner died; the new runner tells the owner."""
+def revive_dead(owner):
+    """Start a runner for each busy worker of `owner` whose runner died; the new runner mails the owner an error."""
     wd = os.path.join(root(), "workers")
     for fn in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
         r = read_worker(fn[:-5]) if fn.endswith(".json") else None
-        if not r or r.get("state") not in BUSY or (owner and r.get("owner") != owner):
+        if not r or r.get("state") not in BUSY or r.get("owner") != owner:
             continue
         if r.get("pid") is None:  # not started yet: give spawn_runner its moment
             age = datetime.now(timezone.utc) - datetime.fromisoformat(r.get("updated") or now_iso())
@@ -232,7 +232,8 @@ def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
 
 
 def tool_list():
-    revive_dead()
+    if me():
+        revive_dead(me())
     recs = []
     wd = os.path.join(root(), "workers")
     for fn in sorted(os.listdir(wd)) if os.path.isdir(wd) else []:
@@ -247,6 +248,7 @@ def tool_list():
 def tool_inbox():
     if not me():
         raise MailError("AGENT_MAIL_NAME is not set: this instance has no inbox")
+    revive_dead(me())  # an owner without push polls here: a dead runner must surface here too
     return json.dumps(claim_inbox(me()))
 
 
