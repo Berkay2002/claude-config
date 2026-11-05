@@ -893,12 +893,35 @@ def council_cli(args):
     return 0
 
 
+def send_cli(args):
+    """`send <to> <text>` from a script (cron, hooks): the same delivery as the MCP send tool."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="agent_mail.py send")
+    ap.add_argument("--from", dest="frm", help="sender name (default: AGENT_MAIL_NAME)")
+    ap.add_argument("to")
+    ap.add_argument("text")
+    a = ap.parse_args(args)
+    try:
+        frm = a.frm if a.frm is not None else os.environ.get("AGENT_MAIL_NAME") or ""
+        if check_name(frm, "sender (--from or AGENT_MAIL_NAME)") == USER:  # only the council CLI speaks as the user
+            raise MailError(f"the sender name {USER!r} is reserved for the user's own `council` CLI")
+        root()
+        os.environ["AGENT_MAIL_NAME"] = frm  # tool_send takes the sender from me()
+        print(tool_send(a.to, a.text))
+    except MailError as e:
+        print(f"agent-mail send: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "serve"
     if cmd == "serve":
         Server().serve()
     elif cmd == "council":
         return council_cli(argv[2:])
+    elif cmd == "send":
+        return send_cli(argv[2:])
     elif cmd == "run" and len(argv) == 3:
         try:
             root()
@@ -908,7 +931,7 @@ def main(argv):
             return 2
         run_worker(argv[2])
     else:
-        print("usage: agent_mail.py [serve | run <worker> | council post|read|tail]", file=sys.stderr)
+        print("usage: agent_mail.py [serve | run <worker> | council post|read|tail | send [--from NAME] <to> <text>]", file=sys.stderr)
         return 2
     return 0
 
