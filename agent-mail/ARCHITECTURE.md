@@ -144,6 +144,27 @@ stateDiagram-v2
 | Retire races | `retire` holds the runner lock, deletes the record and folder, and keeps the lock files, so a runner that opened the lock before still shares it with the next one. `send` re-checks the record under the record lock: mail to a just-retired worker goes to the inbox of that name, never into a dead queue. A runner that finds no record exits without writing one. |
 | Restricted workers | `sandbox` defaults to `full` (bypass flag). A `read-only` or `workspace-write` worker can't start a looser one. |
 
+## Channels
+
+**TL;DR:** a channel is a history file plus one inbox copy per other member, so group chat reuses inbox push.
+
+```mermaid
+flowchart LR
+    P["post(channel, text)<br/>or council CLI (from user)"] -->|"flock channels/c.lock"| H["channels/c.jsonl<br/>append entry, next id"]
+    H -->|"copy, kind post"| IA["inbox/member-a"]
+    H -->|"copy, kind post"| IB["inbox/member-b"]
+    IA -.->|"push, if the sender is a member"| A["session a"]
+    U["user: council tail / read"] -.->|"reads"| H
+```
+
+| Concern | How it is handled |
+|---|---|
+| Unique, ordered ids | The poster holds the channel lock while it reads the last id, appends, fsyncs and mails the copies, so ids and inbox order match file order. |
+| Torn line | A reader skips a line that does not parse; a writer that finds no trailing newline starts a new line. |
+| Members | Only from `channels/<channel>.json`; the poster must be listed, and the push re-checks that the sender still is. |
+| The user | The name `user` is refused as `AGENT_MAIL_NAME` and as a worker name; only the CLI posts as `user`. Same-account convention, not a boundary. |
+| Push meta | `channel`, `post_id`, `reply_to` beside `from` and `kind`: identifiers only, because Claude drops meta keys with hyphens. |
+
 ## Mail folder layout
 
 ```
@@ -151,6 +172,10 @@ $AGENT_MAIL_DIR/
 ├── tmp/                              each message is written here, then renamed into place
 ├── inbox/<name>/new/<ns>-<id>.json   unread
 ├── inbox/<name>/cur/                 claimed
+├── channels/
+│   ├── <channel>.json                members, by hand
+│   ├── <channel>.jsonl               history, append-only
+│   └── <channel>.lock                writers' lock
 └── workers/
     ├── <name>.json                   record: state, owner, thread_id, cwd, sandbox, pid, turns
     ├── <name>.lock, <name>.rec.lock  runner lock, record lock (kept by retire, reused)

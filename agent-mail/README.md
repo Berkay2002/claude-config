@@ -15,6 +15,10 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `list()` | Workers (state, thread id, cwd, last message's first line) and this inbox's unread count. |
 | `codex_usage()` | Codex's live quota from `codex app-server` (`account/rateLimits/read`, about 1.5 s): plan, 5-hour and weekly percent with reset times, banked resets (each zeroes both windows) with expiry and whether they lapse before the weekly reset, `spare_week_percent_per_day` and `use_before_lapse_percent_per_day`. Read-only: it never spends a reset. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
+| `post(channel, text, reply_to?)` | Appends to a channel's history and mails a copy to every other member (see Channels). |
+| `read(channel, since?)` | A channel's history after a post id or an ISO time (with zone), the newest 100 at most. Members only. |
+
+`list()` also returns `channels`: the channels this instance is a member of.
 
 Mail kinds: `message`, `turn_end` (the worker's last message), `error` (nonzero exit, `turn.failed`, no last
 message, a turn over 4 hours, or a runner that died; the text names the cause and the log). Silence never means
@@ -80,6 +84,53 @@ alias codex-mail='codex -c mcp_servers.agent-mail.command="python3.11" \
   delivered at least once: a crash in the instant between mailing the result and clearing the turn replays it.
 - Every turn re-injects the agent-mail server with `-c mcp_servers.agent-mail.*` (command, args, name, dir, plus
   `CODEX_HOME` and `AGENT_MAIL_CODEX`, because Codex hands MCP servers a filtered env).
+
+## Channels (group chats)
+
+A channel is one shared conversation: every member posts there and gets every other member's posts. Members come
+from `$AGENT_MAIL_DIR/channels/<channel>.json`, written by hand:
+
+```json
+{"members": ["planner", "reviewer", "user"]}
+```
+
+- `post` appends the entry to the history under a file lock, then drops a copy (kind `post`) into every other
+  member's inbox, so the normal push delivers it. The user gets no inbox copy: they read the history. A Claude
+  sees it as `<channel source="agent-mail" from="planner" kind="post" channel="council" post_id="12" reply_to="9">`
+  and answers with `post(channel, text, reply_to=post_id)`. Posts that arrive while a session is busy come in as
+  one batch on its next turn.
+- A copy whose sender is not (or no longer) a member of that channel is dropped before push and `inbox`.
+- Unknown channel, non-member poster or reader, and bad names (letters, digits, `_` and `-`, as for inboxes) are
+  refused.
+
+**The user** has the reserved name `user`. No MCP instance can run as `user` (every tool fails with that
+`AGENT_MAIL_NAME`) and no worker can be named `user`. The user posts and reads from their own shell:
+
+```
+python3.11 agent_mail.py council post "text" [--reply-to 12]
+python3.11 agent_mail.py council read [--since 12 | --since 2026-11-05T10:00:00+00:00]
+python3.11 agent_mail.py council tail          # last 20, then follows new posts
+```
+
+(`--channel <name>` before the subcommand picks another channel; `user` must be in its members.) Posts made this way
+are `from: user` whatever `AGENT_MAIL_NAME` says, and only those are the user's own words. **This is a convention
+between honest sessions of the same Unix account, not a security boundary**: any process of that account can append
+to the history or drop a file into an inbox claiming `from: user`. Permission relay (`claude/channel/permission`)
+is deliberately not declared for the same reason: every member could approve another session's tool calls.
+
+**History format** (`channels/<channel>.jsonl`, append-only, one JSON object per line, UTF-8), for readers such as a
+dashboard (read the file; post through the CLI, never write the file):
+
+| Key | Value |
+|---|---|
+| `id` | integer, 1, 2, 3, ... in file order, unique per channel |
+| `ts` | UTC ISO 8601 with offset, seconds, e.g. `2026-11-05T10:12:03+00:00` |
+| `from` | poster name; `user` for the user |
+| `text` | the post |
+| `reply_to` | optional: the id of the post this answers |
+
+A line that does not parse (cut short by a crash) is skipped; the next post starts on a new line.
+`channels/<channel>.lock` is the writers' lock file.
 
 ## Permissions: workers run unsandboxed by default
 

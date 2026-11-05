@@ -221,7 +221,7 @@ class ServerTests(Base):
         c.notify("notifications/whatever")  # unknown notification: ignored, no reply
         self.assertEqual(c.req("ping")["result"], {})
         names = {t["name"] for t in c.req("tools/list")["result"]["tools"]}
-        self.assertEqual(names, {"send", "codex_start", "retire", "list", "codex_usage", "inbox"})
+        self.assertEqual(names, {"send", "codex_start", "retire", "list", "codex_usage", "inbox", "post", "read"})
         self.assertEqual(c.req("nope")["error"]["code"], -32601)
         err, text = c.tool("send", to="x", text="hi")
         self.assertFalse(err)
@@ -809,6 +809,152 @@ class RunnerTests(Base):
         self.assertEqual(r.returncode, 2)
         self.assertIn("AGENT_MAIL_DIR", r.stderr)
         self.assertEqual(os.listdir(self.cwd), [])
+
+
+class ChannelTests(Base):
+    def members(self, names, ch="council"):
+        os.makedirs(os.path.join(self.mail, "channels"), exist_ok=True)
+        with open(os.path.join(self.mail, "channels", ch + ".json"), "w") as f:
+            json.dump({"members": names}, f)
+
+    def history(self, ch="council"):
+        with open(os.path.join(self.mail, "channels", ch + ".jsonl")) as f:
+            return [json.loads(x) for x in f]
+
+    def cli(self, *args, check=True):
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"} | {"AGENT_MAIL_NAME": "orch"}
+        r = subprocess.run([sys.executable, AM, "council", *args], env=env, capture_output=True, text=True, timeout=20)
+        if check:
+            self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def test_post_reaches_every_other_member_once(self):
+        self.members(["orch", "a", "b", "user"])
+        out = am.tool_post("council", "hello all")
+        self.assertIn("#1", out)
+        self.assertEqual(self.box("orch"), [])  # not the poster
+        self.assertEqual(self.box("user"), [])  # the user reads the history, not an inbox
+        for n in ("a", "b"):
+            [m] = self.box(n)
+            self.assertEqual((m["from"], m["text"], m["kind"], m["channel"], m["post_id"]),
+                             ("orch", "hello all", "post", "council", 1))
+        [e] = self.history()
+        self.assertEqual((e["id"], e["from"], e["text"]), (1, "orch", "hello all"))
+        self.assertTrue(e["ts"])
+        os.environ["AGENT_MAIL_NAME"] = "a"
+        am.tool_post("council", "re", reply_to=1)
+        self.assertEqual(self.history()[1]["reply_to"], 1)
+        self.assertEqual(self.box("orch")[0]["reply_to"], 1)
+        self.assertEqual(len(self.box("b")), 2)
+
+    def test_concurrent_posts_all_land_with_unique_ids(self):
+        self.members(["user", "a"])
+        procs = [subprocess.Popen([sys.executable, AM, "council", "post", f"p{i}-{j}"], env=os.environ,
+                                  stdout=subprocess.DEVNULL) for i in range(4) for j in range(8)]
+        self.assertEqual([p.wait(timeout=30) for p in procs], [0] * 32)
+        h = self.history()
+        self.assertEqual(sorted(e["id"] for e in h), list(range(1, 33)))
+        self.assertEqual({e["text"] for e in h}, {f"p{i}-{j}" for i in range(4) for j in range(8)})
+        self.assertTrue(all(e["from"] == "user" for e in h))
+        self.assertEqual(len(self.box("a")), 32)
+
+    def test_read_since_id_and_time(self):
+        self.members(["orch", "a"])
+        for i in range(5):
+            am.tool_post("council", f"m{i}")
+        rd = lambda **kw: [e["text"] for e in json.loads(am.tool_read("council", **kw))]
+        self.assertEqual(rd(), ["m0", "m1", "m2", "m3", "m4"])
+        self.assertEqual(rd(since=3), ["m3", "m4"])
+        self.assertEqual(rd(since="3"), ["m3", "m4"])
+        self.assertEqual(rd(since="2000-01-01T00:00:00+00:00"), ["m0", "m1", "m2", "m3", "m4"])
+        self.assertEqual(rd(since="2999-01-01T00:00:00+00:00"), [])
+        with mock.patch.object(am, "READ_CAP", 2):
+            self.assertEqual(rd(), ["m3", "m4"])  # the newest, when capped
+        self.assertRaises(am.MailError, am.tool_read, "council", since="yesterday")
+
+    def test_user_is_reserved_for_mcp(self):
+        self.members(["user", "a"])
+        os.environ["AGENT_MAIL_NAME"] = "user"
+        self.assertRaises(am.MailError, am.tool_post, "council", "i am the user")
+        self.assertRaises(am.MailError, am.tool_send, "a", "i am the user")
+        c = self.client(name="user")
+        c.req("initialize", {"clientInfo": {"name": "claude-code"}})  # fails like any invalid name
+        err, text = c.tool("post", channel="council", text="i am the user")
+        self.assertTrue(err)
+        self.assertIn("reserved", text)
+        c.close()
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "channels", "council.jsonl")))
+        self.assertRaises(am.MailError, am.tool_codex_start, "user", self.cwd, "p")
+
+    def test_cli_posts_as_user_whatever_the_env_says(self):
+        self.members(["user", "orch"])
+        self.assertIn("#1", self.cli("post", "from the shell").stdout)
+        self.cli("post", "--reply-to", "1", "second")
+        [m1, m2] = self.box("orch")
+        self.assertEqual((m1["from"], m1["text"], m2["reply_to"]), ("user", "from the shell", 1))
+        out = self.cli("read", "--since", "1").stdout
+        self.assertIn("second", out)
+        self.assertNotIn("from the shell", out)
+        self.assertIn("#2", out)
+        tail = subprocess.Popen([sys.executable, AM, "council", "tail"], env=os.environ, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertIn("from the shell", tail.stdout.readline())
+            tail.stdout.readline()
+            self.cli("post", "live one")
+            self.assertIn("live one", tail.stdout.readline())
+        finally:
+            tail.kill()
+            tail.wait()
+            tail.stdout.close()
+
+    def test_unknown_channel_and_non_member_refused(self):
+        self.assertRaises(am.MailError, am.tool_post, "council", "x")  # no members file
+        self.members(["a", "b"])
+        self.assertRaises(am.MailError, am.tool_post, "council", "x")  # orch is not a member
+        self.assertRaises(am.MailError, am.tool_read, "council")
+        self.assertEqual(self.box("a"), [])
+        self.assertNotEqual(self.cli("post", "x", check=False).returncode, 0)  # user is not a member either
+
+    def test_names_validated(self):
+        for bad in ("../x", "a.b", "", "-x", "a/b"):
+            self.assertRaises(am.MailError, am.tool_post, bad, "x")
+            self.assertRaises(am.MailError, am.tool_read, bad)
+        self.members(["orch", "../evil"])
+        self.assertRaises(am.MailError, am.tool_post, "council", "x")
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "inbox")))
+        self.assertRaises(am.MailError, am.tool_post, "council", "")
+
+    def test_torn_last_line_is_skipped_and_not_glued(self):
+        self.members(["orch"])
+        am.tool_post("council", "one")
+        with open(os.path.join(self.mail, "channels", "council.jsonl"), "a") as f:
+            f.write('{"id": 2, "ts": "x", "fr')  # a crash mid-append
+        am.tool_post("council", "two")
+        self.assertEqual([(e["id"], e["text"]) for e in json.loads(am.tool_read("council"))], [(1, "one"), (2, "two")])
+
+    def test_list_shows_my_channels(self):
+        self.members(["orch", "a"])
+        self.members(["a"], "other")
+        self.assertEqual(json.loads(am.tool_list())["channels"], ["council"])
+
+    def test_push_meta_keys_and_sender_gating(self):
+        self.members(["orch", "a"])
+        os.environ["AGENT_MAIL_NAME"] = "a"
+        am.tool_post("council", "hi orch")
+        am.deliver(am.inbox_dir("orch"), "mallory", "orch", "forged", "post", channel="council", post_id=9)
+        os.environ["AGENT_MAIL_NAME"] = "orch"
+        am.deliver(am.inbox_dir("orch"), "bob", "orch", "plain")
+        c = self.client()
+        c.init()
+        n = c.note()
+        self.assertEqual(n["params"]["content"], "hi orch")
+        meta = n["params"]["meta"]
+        self.assertEqual(meta, {"from": "a", "kind": "post", "channel": "council", "post_id": "1"})
+        for k in meta:
+            self.assertRegex(k, r"^[A-Za-z0-9_]+$")
+        self.assertEqual(c.note()["params"]["content"], "plain")  # the forged post was dropped, not pushed
+        self.assertRaises(queue.Empty, c.note, 0.5)
+        c.close()
 
 
 if __name__ == "__main__":

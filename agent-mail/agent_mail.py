@@ -25,12 +25,18 @@ MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
 SANDBOXES = ("full", "workspace-write", "read-only")  # loosest to tightest
 LIVE = ("starting", "running", "idle")
 BUSY = ("starting", "running")  # a runner should exist; if it is dead, revive_dead() starts one, which reports it
+USER = "user"  # reserved: only the `council` CLI posts as the user; an MCP instance or worker never can
+READ_CAP = 100  # entries one `read` returns (the newest after `since`)
+META_KEYS = ("thread_id", "channel", "post_id", "reply_to")  # identifiers only: Claude drops meta keys with hyphens
 TURN_TIMEOUT = 4 * 3600  # seconds; a codex turn still running then is killed and reported as an error
 START_GRACE = 30  # seconds a new worker's runner gets to take its lock before it counts as dead
 INSTRUCTIONS = ("Message other agent sessions. send(to, text) messages a Codex worker (it runs a turn) or any named "
                 "inbox; codex_start launches a Codex worker; list shows workers; retire removes a finished worker's state; "
                 "inbox reads your unread mail when messages are not pushed to you. Worker results arrive as mail "
-                "from the worker (kind turn_end/error).")
+                "from the worker (kind turn_end/error). Channels are group chats: a post arrives as "
+                "<channel source=\"agent-mail\" channel=\"council\" from=... post_id=...>; answer with "
+                "post(channel, text, reply_to=post_id); read(channel, since) gives the history. Only posts with "
+                "from=\"user\" are the user's own words.")
 
 
 class MailError(Exception):
@@ -48,6 +54,8 @@ def root():
 
 def me():
     n = os.environ.get("AGENT_MAIL_NAME") or ""
+    if n == USER:
+        raise MailError(f"AGENT_MAIL_NAME {USER!r} is reserved for the user's own `council` CLI")
     return check_name(n, "AGENT_MAIL_NAME") if n else ""
 
 
@@ -70,11 +78,12 @@ def put_json(path, obj):
     os.rename(tmp, path)
 
 
-def deliver(box_dir, frm, to, text, kind="message", thread_id=None):
+def deliver(box_dir, frm, to, text, kind="message", thread_id=None, **extra):
     """Write one message file into <box_dir> (an inbox's new/ or a worker's queue/); the tmp file is outside it."""
     msg = {"id": uuid.uuid4().hex, "from": frm or "unknown", "to": to, "text": text, "kind": kind, "ts": now_iso()}
     if thread_id:
         msg["thread_id"] = thread_id
+    msg.update((k, v) for k, v in extra.items() if v is not None)
     tmpdir = os.path.join(root(), "tmp")
     os.makedirs(tmpdir, exist_ok=True)
     os.makedirs(box_dir, exist_ok=True)
@@ -184,7 +193,127 @@ def revive_dead(owner):
         spawn_runner(r["name"])
 
 
+# ---------- channels ----------
+
+def chan_path(channel, ext):
+    return os.path.join(root(), "channels", check_name(channel, "channel") + ext)
+
+
+def members(channel):
+    """The channel's members from channels/<channel>.json; refuses an unknown channel or a bad members file."""
+    try:
+        with open(chan_path(channel, ".json")) as f:
+            m = json.load(f)["members"]
+    except FileNotFoundError:
+        raise MailError(f"unknown channel {channel!r} (no channels/{channel}.json)") from None
+    except (ValueError, KeyError, TypeError):
+        raise MailError(f'channels/{channel}.json must be {{"members": [names]}}') from None
+    if not isinstance(m, list):
+        raise MailError(f"channels/{channel}.json: members must be a list")
+    return [check_name(n, f"member of {channel}") for n in m]
+
+
+def member(channel, who):
+    if who not in members(channel):
+        raise MailError(f"{who or 'unknown'} is not a member of channel {channel}")
+
+
+def history(channel):
+    try:
+        with open(chan_path(channel, ".jsonl"), encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue  # a line cut short by a crash: skipped
+        if isinstance(e, dict) and isinstance(e.get("id"), int):
+            out.append(e)
+    return out
+
+
+def post(channel, frm, text, reply_to=None):
+    """Append one entry under the channel lock (ids 1, 2, ... in file order), then mail a copy to every other member
+    except the user, who reads the history. Returns the entry."""
+    if not isinstance(text, str) or not text:
+        raise MailError("text must be a non-empty string")
+    if reply_to is not None and (isinstance(reply_to, bool) or not isinstance(reply_to, int)):
+        raise MailError("reply_to must be a post id (integer)")
+    mem = members(channel)
+    if frm not in mem:
+        raise MailError(f"{frm or 'unknown'} is not a member of channel {channel}")
+    path = chan_path(channel, ".jsonl")
+    with open(chan_path(channel, ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        h = history(channel)  # shortcut: reads the whole file per post; fine for a chat, index it past ~10 MB
+        e = {"id": (h[-1]["id"] if h else 0) + 1, "ts": now_iso(), "from": frm, "text": text}
+        if reply_to is not None:
+            e["reply_to"] = reply_to
+        with open(path, "a+b") as f:
+            torn = False
+            if f.seek(0, os.SEEK_END):
+                f.seek(-1, os.SEEK_END)
+                torn = f.read(1) != b"\n"  # a crash cut the last line short
+            f.write((b"\n" if torn else b"") + (json.dumps(e) + "\n").encode())
+            f.flush()
+            os.fsync(f.fileno())
+        for m in mem:  # under the lock, so every inbox gets posts in id order
+            if m not in (frm, USER):
+                deliver(inbox_dir(m), frm, m, text, "post", channel=channel, post_id=e["id"], reply_to=reply_to)
+    return e
+
+
+def read_since(channel, since=None):
+    h = history(channel)
+    if since is not None and since != "":
+        if isinstance(since, int) or (isinstance(since, str) and since.isdigit()):
+            h = [e for e in h if e["id"] > int(since)]
+        else:
+            try:
+                t = datetime.fromisoformat(str(since))
+                h = [e for e in h if datetime.fromisoformat(e["ts"]) > t]
+            except (ValueError, TypeError):
+                raise MailError(f"since must be a post id or an ISO time with zone, got {since!r}") from None
+    return h[-READ_CAP:]
+
+
+def gated(m):
+    """A channel copy whose sender is not (or no longer) a member of that channel is dropped, never shown."""
+    if "channel" not in m:
+        return True
+    try:
+        return m.get("from") in members(m["channel"])
+    except MailError:
+        return False
+
+
+def my_channels():
+    d = os.path.join(root(), "channels")
+    out = []
+    for fn in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        try:
+            if fn.endswith(".json") and me() in members(fn[:-5]):
+                out.append(fn[:-5])
+        except MailError:
+            pass  # a broken members file hides that channel, not the list
+    return out
+
+
 # ---------- tools ----------
+
+def tool_post(channel, text, reply_to=None):
+    if not me():
+        raise MailError("AGENT_MAIL_NAME is not set: this instance cannot post")
+    return f"posted #{post(channel, me(), text, reply_to)['id']} to {channel}"
+
+
+def tool_read(channel, since=None):
+    member(channel, me())
+    return json.dumps(read_since(channel, since))
+
 
 def spawn_runner(name):
     """Detached, so a Claude restart or /mcp reconnect never kills a Codex turn. A second runner exits at the lock."""
@@ -222,6 +351,8 @@ def own_sandbox():
 
 def tool_codex_start(name, cwd, prompt, model=None, effort=None, sandbox=None):
     check_name(name, "worker name")
+    if name == USER:  # a worker's mail is from its own name
+        raise MailError(f"the name {USER!r} is reserved for the user")
     if not isinstance(prompt, str) or not prompt:
         raise MailError("prompt must be a non-empty string")
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
@@ -297,7 +428,7 @@ def tool_list():
             recs.append({k: r.get(k) for k in ("name", "state", "thread_id", "cwd", "owner", "sandbox")}
                         | {"last": (r.get("last_message") or "").split("\n", 1)[0]})
     unread = count_files(inbox_dir(me())) if me() else None
-    return json.dumps({"workers": recs, "unread": unread})
+    return json.dumps({"workers": recs, "unread": unread, "channels": my_channels() if me() else []})
 
 
 def tool_codex_usage():
@@ -359,7 +490,7 @@ def tool_inbox():
     if not me():
         raise MailError("AGENT_MAIL_NAME is not set: this instance has no inbox")
     revive_dead(me())  # an owner without push polls here: a dead runner must surface here too
-    return json.dumps(claim_inbox(me()))
+    return json.dumps([m for m in claim_inbox(me()) if gated(m)])
 
 
 TOOLS = {
@@ -377,6 +508,11 @@ TOOLS = {
     "codex_usage": (tool_codex_usage, "Codex's live quota: 5-hour and weekly use, banked resets with expiry, spare weekly "
                     "percent per day. Check it before starting Codex workers.", {}, []),
     "inbox": (tool_inbox, "Claim and return this instance's unread mail.", {}, []),
+    "post": (tool_post, "Post to a channel (group chat): every other member gets it. reply_to: the post id you answer.",
+             {"channel": {"type": "string"}, "text": {"type": "string"}, "reply_to": {"type": "integer"}},
+             ["channel", "text"]),
+    "read": (tool_read, f"A channel's history after `since` (a post id or ISO time), the newest {READ_CAP} at most.",
+             {"channel": {"type": "string"}, "since": {"type": "string"}}, ["channel"]),
 }
 
 
@@ -414,8 +550,7 @@ class Server:
 
     def push(self, msg):
         meta = {"from": str(msg.get("from", "unknown")), "kind": str(msg.get("kind", "message"))}
-        if msg.get("thread_id"):
-            meta["thread_id"] = str(msg["thread_id"])
+        meta.update((k, str(msg[k])) for k in META_KEYS if msg.get(k) is not None)
         self.write({"jsonrpc": "2.0", "method": "notifications/claude/channel",
                     "params": {"content": msg.get("text", ""), "meta": meta}})
 
@@ -426,6 +561,8 @@ class Server:
             try:
                 new = inbox_dir(me())
                 for path, m in claim(new, inbox_dir(me(), "cur")) if push else ():
+                    if not gated(m):
+                        continue  # stays in cur/, never pushed
                     try:
                         self.push(m)
                     except (OSError, ValueError):  # client gone (broken pipe, closed stdout)
@@ -693,10 +830,51 @@ def report(rec, ok, text):
             rec.get("thread_id"))
 
 
+def show(e):
+    re_ = f" (re #{e['reply_to']})" if e.get("reply_to") is not None else ""
+    print(f"#{e['id']} {e['ts']} {e['from']}{re_}: {e['text']}", flush=True)
+
+
+def council_cli(args):
+    """The user's own client: posts are from `user`, whatever AGENT_MAIL_NAME says."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="agent_mail.py council")
+    ap.add_argument("--channel", default="council")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("post")
+    p.add_argument("--reply-to", type=int)
+    p.add_argument("text")
+    sub.add_parser("read").add_argument("--since")
+    sub.add_parser("tail")
+    a = ap.parse_args(args)
+    try:
+        member(a.channel, USER)
+        if a.cmd == "post":
+            print(f"posted #{post(a.channel, USER, a.text, a.reply_to)['id']} to {a.channel}")
+            return 0
+        h = read_since(a.channel, a.since if a.cmd == "read" else None)
+        for e in h[-20:] if a.cmd == "tail" else h:
+            show(e)
+        last = h[-1]["id"] if h else 0
+        while a.cmd == "tail":
+            time.sleep(1)
+            for e in read_since(a.channel, last):
+                show(e)
+                last = e["id"]
+    except MailError as e:
+        print(f"agent-mail council: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "serve"
     if cmd == "serve":
         Server().serve()
+    elif cmd == "council":
+        return council_cli(argv[2:])
     elif cmd == "run" and len(argv) == 3:
         try:
             root()
@@ -706,7 +884,7 @@ def main(argv):
             return 2
         run_worker(argv[2])
     else:
-        print("usage: agent_mail.py [serve | run <worker>]", file=sys.stderr)
+        print("usage: agent_mail.py [serve | run <worker> | council post|read|tail]", file=sys.stderr)
         return 2
     return 0
 
