@@ -25,8 +25,9 @@ class FakeSession:
         self.dialogs, self.sent, self.calls, self.offsets = {}, [], [], []
         self.ok = True
 
-    def send(self, text, files=()):
+    def send(self, text, files=(), allow_command=False):
         self.calls.append(("send", text))
+        self.allow_command = allow_command
 
     def answer(self, did, choice):
         self.calls.append(("answer", did, choice))
@@ -98,6 +99,7 @@ class Turns(Base):
         self.assertEqual(f[-1]["user_message_uuids"], ["t3-1"])
         self.assertEqual(f[-1]["result"], "ok")
         self.assertTrue(wait_for(lambda: ("send", "hi") in self.s.calls))
+        self.assertTrue(self.s.allow_command)   # a person typed it in T3
         self.assertEqual(self.s.offsets, [10])
 
     def test_events_before_t3_can_route_them_are_held_then_shown_as_wake_turns(self):
