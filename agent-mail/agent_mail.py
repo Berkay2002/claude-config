@@ -902,7 +902,10 @@ def send_cli(args):
     ap.add_argument("text")
     a = ap.parse_args(args)
     try:
-        frm = a.frm if a.frm is not None else os.environ.get("AGENT_MAIL_NAME") or ""
+        own = os.environ.get("AGENT_MAIL_NAME") or ""
+        if own and a.frm is not None and a.frm != own:  # a named session sends only as itself, never as a peer
+            raise MailError(f"--from {a.frm!r} refused: this session is {own!r} (AGENT_MAIL_NAME)")
+        frm = a.frm if a.frm is not None else own
         if check_name(frm, "sender (--from or AGENT_MAIL_NAME)") == USER:  # only the council CLI speaks as the user
             raise MailError(f"the sender name {USER!r} is reserved for the user's own `council` CLI")
         root()
