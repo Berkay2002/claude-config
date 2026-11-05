@@ -312,8 +312,13 @@ class Bridge:
     def send_failed(self, ev):
         why = {"draft": "someone has text typed in the tmux pane", "dialog": "a dialog is open in the session",
                "timeout": "it never showed up in the session", "tmux": "tmux refused the keys",
-               "session": "the pane no longer runs the attached session under this role's name"}.get(ev["reason"],
-                                                                                                    ev["reason"])
+               "session": "the pane no longer runs the attached session under this role's name",
+               "unbracketed": "the pane has bracketed paste off, so its lines would be submitted one by one",
+               "command": "it starts with / or !, which the bridge never types (run commands in tmux)",
+               "control": "it holds a control character (ESC, DEL, ...), which the bridge never pastes"
+               }.get(ev["reason"], ev["reason"])
+        if ev.get("action"):   # an interrupt, answer or model switch, not a message: the T3 turn goes on
+            return self.notice(f"{ev['action']} not applied ({why}); try again")
         self.notice(f"message not delivered ({why}); send it again: {ev['text'][:200]}")
         if self.turn is not None and self.turn["t3_uuid"] and not self.turn["landed"]:
             self.close_turn()
@@ -442,7 +447,10 @@ class Bridge:
                     self.notice("a turn typed in tmux/RC is running; the live session queues this message")
                     self.close_turn()   # the rest of that turn shows in T3's turn, which ends after T3's prompt
                 self.open_turn(msg.get("uuid") or str(uuid.uuid4()))
-        threading.Thread(target=self.s.send, args=(text, files), daemon=True).start()   # may wait for a draft
+        # A person typed this in T3, so their own /commands and !shell may go through (the core still refuses
+        # /model and /effort, which would persist to the global settings).
+        threading.Thread(target=self.s.send, args=(text, files), kwargs={"allow_command": True},
+                         daemon=True).start()   # may wait for a draft
 
     # ---- deploys ----
     def code_files(self):

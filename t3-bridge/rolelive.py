@@ -25,7 +25,11 @@ Events (dicts, key "kind"; names and fields are stable, front ends map them):
     dialog_closed id, by ("us" | "elsewhere")
     send_failed  text, reason ("draft": the pane's input line held someone's draft, "dialog": a dialog was open,
                  "timeout": the text never showed up as a prompt, "tmux": tmux refused, "session": the pane no
-                 longer runs the attached session under its name; the core re-resolves the role before the next send)
+                 longer runs the attached session under its name; the core re-resolves the role before the next send,
+                 "unbracketed": a multi-line text while the pane had bracketed paste off (nothing typed),
+                 "command": the text starts with / or ! without allow_command, or is /model or /effort,
+                 "control": the text holds a control character other than tab and newline: never pasted);
+                 action ("interrupt" | "answer" | "set_model", text "") when the refused input was not a send
     session      session_id, pane, switched (bool)   (attach, /clear or restart)
     notice       text   (anything the core did not understand: never dropped silently)
   Transcript events also carry parent_tool_use_id (None, or the Agent call a subagent's event belongs to), offset
@@ -53,6 +57,9 @@ DRAFT_WAIT = 5             # seconds to wait for someone's draft in the pane to 
 SGR = re.compile(r"\x1b\[[0-9;:]*m")
 PASTED = re.compile(r"(?:\[Pasted text #\d+[^\]]*\]\s*)+")   # how the box shows a long paste
 DIM = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)", re.S)   # placeholder and suggestion text is dim
+PROBE = b"x\x7f"           # bracketed-paste probe: see _bracketed
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")   # every C0 control and DEL except \t \n \r
+NEVER_TYPED = re.compile(r"/(?:model|effort)(?:\s|$)")   # would save a default for every new session: see set_model
 
 
 def default_claude_dir():
@@ -97,6 +104,23 @@ def input_line(screen):
                     return "\n".join(body).replace(" ", " ").strip()
                 body.append(SGR.sub("", DIM.sub("", lines[j])).removeprefix("❯"))
             return None
+    return None
+
+
+def answer_field(screen, n):
+    """The free-text row of a question dialog in a `capture-pane -p -e` screen: the selected "❯ N. " row and its
+    wrapped lines up to the box's rule. "" when only the dim "Type something." placeholder shows, None when row N
+    is not the selected one."""
+    lines = screen.split("\n")
+    plain = [SGR.sub("", ln) for ln in lines]
+    rows = [i for i, p in enumerate(plain) if re.match(rf"\s*❯\s*{n}\. ", p)]
+    if not rows:
+        return None
+    body = []
+    for j in range(rows[-1], len(lines)):
+        if j > rows[-1] and plain[j].lstrip().startswith("─"):
+            return re.sub(rf"^\s*❯\s*{n}\. ", "", "\n".join(body)).replace(" ", " ").strip()
+        body.append(SGR.sub("", DIM.sub("", lines[j])))
     return None
 
 
@@ -252,30 +276,83 @@ class LiveSession:
                            capture_output=True)
         return r.stdout.decode(errors="replace") if r.returncode == 0 else ""
 
-    def _paste(self, text, submit=True):
-        """True when pasted (and submitted), False when tmux refused, None when the box showed more than our paste
-        (someone typed in the meantime): then Enter is not pressed and the box is left as it is."""
+    def _load_paste(self, data):
         # Named buffer + bracketed paste (-p): newlines don't submit early and the user's paste buffer is untouched.
-        ok = self._tmux("load-buffer", "-b", "rolelive", "-", data=text.encode())
-        ok = ok and self._tmux("paste-buffer", "-d", "-p", "-b", "rolelive", "-t", self.pane)
-        if ok and submit:
-            if not self._box_is(text):
-                # Never cleared: the cursor position is unknown, so deleting could eat the other person's keys.
-                self.notice("someone typed into the input box while a message was pasted; not submitted, the box "
-                            f"holds both texts: {text[:200]}")
-                return None
-            ok = self._tmux("send-keys", "-t", self.pane, "Enter")
-        return ok
+        return (self._tmux("load-buffer", "-b", "rolelive", "-", data=data)
+                and self._tmux("paste-buffer", "-d", "-p", "-b", "rolelive", "-t", self.pane))
 
-    def _box_is(self, text):
-        """The prompt box shows exactly the pasted text (wrapping aside), or only the CLI's placeholder for a long
-        paste. Polled briefly: the paste takes a moment to reach the screen."""
-        want = re.sub(r"\s+", "", text)
+    def _paste(self, text, read=input_line):
+        """Paste text into the empty field that read(screen) returns (the prompt box by default) and press Enter.
+        True when submitted, False when tmux refused, None when the field showed more than our paste (someone
+        typed in the meantime: Enter is not pressed and the field is left as it is), "unbracketed" when a
+        multi-line text could not be pasted as one bracketed paste (nothing of it typed), "control" when the text
+        holds a control character (an ESC[201~ would end the bracket early and turn the rest into keys)."""
+        if CONTROL.search(text):
+            self.notice(f"text with a control character (ESC, DEL, ...) is never pasted: {text[:200]!r}")
+            return "control"
+        if "\n" in text or "\r" in text:
+            probed = self._bracketed(read)
+            if probed is not True:
+                return probed
+        if not self._load_paste(text.encode()):
+            return False
+        if not self._box_is(text, read):
+            # Never cleared: the cursor position is unknown, so deleting could eat the other person's keys.
+            self.notice("someone typed into the input box while a message was pasted; not submitted, the box "
+                        f"holds both texts: {text[:200]}")
+            return None
+        return self._tmux("send-keys", "-t", self.pane, "Enter")
+
+    def _bracketed(self, read):
+        """Does tmux bracket a paste into this pane? paste-buffer -p adds the markers only while the app has
+        bracketed paste (DECSET 2004) on, and tmux 2.7 has no format for that mode. So paste PROBE (x + DEL) into
+        the empty field: bracketed, the CLI inserts both literally and shows "x" (the DEL stays, invisible);
+        unbracketed, they arrive as keys and the DEL erases the x. True when bracketed (the probe removed again),
+        "unbracketed", None when the field shows anything else (left as it is), False when tmux refused."""
+        if not self._load_paste(PROBE):
+            return False
+        shown = self._settled(read)
+        if shown == "":
+            self.notice("the session's pane does not have bracketed paste on, so a multi-line message would be "
+                        "submitted line by line; not sent (the CLI turns it back on once it reads input: send it "
+                        "again)")
+            return "unbracketed"
+        if shown == "x":   # the field held only our probe: two BSpace remove exactly it (one more is a no-op)
+            ok = self._tmux("send-keys", "-t", self.pane, "BSpace", "BSpace")
+            if not ok:
+                return False
+            if self._settled(read) == "":
+                return True
+        self.notice(f"the input box did not show only the bracketed-paste probe; message not sent, the box is left "
+                    f"as it is and may hold the probe's x: {shown!r}")
+        return None
+
+    def _settled(self, read):
+        """What read(screen) returns once two polls 0.3 s apart agree (a render can be half drawn), else None."""
+        prev = object()
+        for _ in range(6):
+            time.sleep(0.3)
+            cur = read(self.screen(escapes=True))
+            if cur == prev:
+                return cur
+            prev = cur
+        return None
+
+    def _box_is(self, text, read=input_line):
+        """The field shows exactly the pasted text (wrapping aside), only the CLI's placeholder for a long paste,
+        or, on two polls in a row, a tail of it over several rows: the CLI clips a tall box to its last rows, and
+        the clipped head is never drawn, so neither the pane nor tmux's history has it. Polled briefly: the
+        paste takes a moment to reach the screen."""
+        want, prev = re.sub(r"\s+", "", text), None
         for _ in range(4):
             time.sleep(0.3)
-            box = input_line(self.screen(escapes=True))
-            if box is not None and (re.sub(r"\s+", "", box) == want or PASTED.fullmatch(box)):
+            box = read(self.screen(escapes=True))
+            got = None if box is None else re.sub(r"\s+", "", box)
+            if got is not None and (got == want or PASTED.fullmatch(box)):
                 return True
+            if got and "\n" in box and want.endswith(got) and got == prev:
+                return True
+            prev = got
         return False
 
     def _keys(self, *keys):
@@ -301,27 +378,29 @@ class LiveSession:
                 return "dialog" if dialog or box is None else "draft"
             time.sleep(0.5)
 
-    def send(self, text, files=()):
+    def send(self, text, files=(), allow_command=False):
         """Real user input: typed into the pane. Files (images, PDFs) are attached as @path mentions.
-        Never merges into someone's half-typed draft or answers an open dialog: emits send_failed instead."""
+        Never merges into someone's half-typed draft or answers an open dialog: emits send_failed instead.
+        Text starting with / or ! (a slash command, a shell command) is typed only with allow_command=True;
+        /model and /effort never (they would save a default for every new session: set_model switches)."""
         if files:
             text = (text + "\n" if text else "") + " ".join("@" + p for p in files)
-        reason = self._ready_to_type()
-        if reason is None and not self._still_attached():
+        head = text.lstrip()
+        if NEVER_TYPED.match(head) or head[:1] in ("/", "!") and not allow_command:
+            reason = "command"
+        else:
+            reason = self._ready_to_type()
+        if reason is None and not self._session_ok():
             reason = "session"
-            with self.lock:
-                live = self._find()
-                if live:
-                    self._follow(live)
         elif reason is None:
             with self.lock:
                 self.sent.append([text, time.time()])
             pasted = self._paste(text)
-            if pasted:
+            if pasted is True:
                 return True
             with self.lock:
                 self.sent = [s for s in self.sent if s[0] is not text]
-            reason = "tmux" if pasted is False else "draft"
+            reason = pasted if isinstance(pasted, str) else "tmux" if pasted is False else "draft"
         self.emit({"kind": "send_failed", "text": text, "reason": reason})
         return False
 
@@ -331,8 +410,22 @@ class LiveSession:
         cur = find_session(self.claude_dir, session_id=self.session_id, tmux_session=self.tmux_session)
         return bool(cur) and cur["tmux"] == self.live["tmux"] and (not self.role or cur.get("name") == self.role)
 
+    def _session_ok(self, action=None):
+        """The pre-send check for every key we press. When it fails, re-resolve the role for the next try; with an
+        action (not a send), also emit its send_failed."""
+        if self._still_attached():
+            return True
+        with self.lock:
+            live = self._find()
+            if live:
+                self._follow(live)
+        if action:
+            self.emit({"kind": "send_failed", "text": "", "reason": "session", "action": action})
+        return False
+
     def interrupt(self):
-        self._keys("Escape")
+        if self._session_ok("interrupt"):
+            self._keys("Escape")
 
     # A typed "/model M" or "/effort E" also saves the choice as the default for every new session (settings.json
     # "model", modelSettings.<model>.effortLevel). The /model picker's "s" key switches model and effort for this
@@ -353,6 +446,8 @@ class LiveSession:
         for this session only. Refuses with a notice when anything on screen is not as expected."""
         if effort is not None and effort not in EFFORTS:
             self.notice(f"unknown effort {effort!r}; not applied")
+            return False
+        if not self._session_ok("set_model"):
             return False
         reason = "a turn is running" if self.status() != "idle" or self.turn else self._ready_to_type()
         if reason is not None:
@@ -456,11 +551,14 @@ class LiveSession:
         if d is None:
             self.notice(f"no open dialog {dialog_id}")
             return False
+        if not self._session_ok("answer"):
+            return False
         scr = self._on_screen(d)
         if scr is None:
             self.notice(f"dialog {dialog_id} ({d['tool']}) is not on the session's screen; not answered from here")
             return False
         with self.lock:
+            turn = self.turn
             self.dialogs.pop(dialog_id, None)
             if d["synthetic"] and not d.get("tool_use_id"):
                 self.unbound[dialog_id] = (d["tool"], d["input"])
@@ -486,9 +584,15 @@ class LiveSession:
                     if q.get("multiSelect"):
                         self._keys("Tab")
                 else:   # free text goes in the "Type something" row right after the options
-                    self._keys(str(len(labels) + 1))
-                    self._paste(ans, submit=False)
-                    self._keys("Enter")
+                    n = len(labels) + 1
+                    self._keys(str(n))
+                    if self._paste(ans, read=lambda scr, n=n: answer_field(scr, n)) is not True:
+                        with self.lock:   # not entered: the dialog stays open, unless its turn ended meanwhile
+                            if self.turn is turn:
+                                self.dialogs[dialog_id] = d
+                                self.unbound.pop(dialog_id, None)
+                        self.notice(f"free-text answer to dialog {dialog_id} not entered; answer it in tmux")
+                        return False
             time.sleep(0.3)
             if "Review your answers" in self.screen():
                 self._keys("Enter")   # review screen: "1. Submit answers" is selected

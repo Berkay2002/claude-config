@@ -25,8 +25,9 @@ class FakeSession:
         self.dialogs, self.sent, self.calls, self.offsets = {}, [], [], []
         self.ok = True
 
-    def send(self, text, files=()):
+    def send(self, text, files=(), allow_command=False):
         self.calls.append(("send", text))
+        self.allow_command = allow_command
 
     def answer(self, did, choice):
         self.calls.append(("answer", did, choice))
@@ -98,6 +99,7 @@ class Turns(Base):
         self.assertEqual(f[-1]["user_message_uuids"], ["t3-1"])
         self.assertEqual(f[-1]["result"], "ok")
         self.assertTrue(wait_for(lambda: ("send", "hi") in self.s.calls))
+        self.assertTrue(self.s.allow_command)   # a person typed it in T3
         self.assertEqual(self.s.offsets, [10])
 
     def test_events_before_t3_can_route_them_are_held_then_shown_as_wake_turns(self):
@@ -134,6 +136,24 @@ class Turns(Base):
         self.assertEqual([x["type"] for x in f], ["system", "assistant", "result"])
         self.assertIn("someone has text typed in the tmux pane", f[1]["message"]["content"][0]["text"])
         self.assertIsNone(self.b.turn)
+
+    def test_unbracketed_and_command_refusals_are_explained(self):
+        for reason, why in (("unbracketed", "bracketed paste off"), ("command", "starts with / or !"),
+                            ("control", "control character")):
+            self.b.on_user({"type": "user", "uuid": "t3-" + reason, "message": {"role": "user", "content": "hi"}})
+            self.ev("send_failed", text="hi", reason=reason)
+            f = self.frames()
+            self.assertIn(why, f[1]["message"]["content"][0]["text"])
+            self.assertIsNone(self.b.turn)
+
+    def test_refused_interrupt_keeps_the_t3_turn(self):
+        self.t3_turn()
+        self.frames()
+        self.ev("send_failed", text="", reason="session", action="interrupt")
+        f = self.frames()
+        self.assertIn("interrupt not applied", f[0]["message"]["content"][0]["text"])
+        self.assertNotIn("result", [x["type"] for x in f])
+        self.assertIsNotNone(self.b.turn)
 
     def test_t3_message_during_a_tmux_turn_gets_its_result(self):
         self.t3_turn()

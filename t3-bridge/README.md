@@ -43,14 +43,23 @@ The bridge logs to `<claude dir>/t3-bridge/bridge-<role>.log` (0700 dir, 0600 fi
 - `attach(role=None, session_id=None, start_cmd=None, claude_dir=None, tmux_session=None)`, then `start(since=None |
   "saved", state_key=None)` and `close()`. A missing role is started with `start_cmd` and `ROLELIVE_START=1` in its
   environment (no terminal); the start script must put the role in tmux. `save_offset(offset)` records what the consumer delivered.
-- `send(text, files=())`: waits up to 5 s for an empty input line, never types over a draft or into a dialog, presses
-  Enter only when the box shows just its paste, and types only while the pane still runs the attached session under
-  the role's name (after a `/rename` away it refuses once and re-resolves the role).
+- `send(text, files=(), allow_command=False)`: waits up to 5 s for an empty input line, never types over a draft or
+  into a dialog, presses Enter only when the box shows just its paste, and types only while the pane still runs the
+  attached session under the role's name (after a `/rename` away it refuses once and re-resolves the role). Text
+  starting with `/` or `!` needs `allow_command=True`; `/model` and `/effort` are never typed. A multi-line text is
+  pasted only once a probe shows the pane has bracketed paste on (below), never line by line.
 - `interrupt()`, `answer(id, choice)` (`{question: label}`, `"a, b"` for multiSelect, free text, `"allow"`, `"deny"`),
-  `set_model(model=None, effort=None)`, `status()`.
+  `set_model(model=None, effort=None)`, `status()`. These run the same session check as `send`; a free-text answer
+  is entered only when its row shows just that text.
 - Events (dicts with `kind`; names and fields are stable, the module docstring lists every field): `turn_start`,
   `text`, `thinking`, `tool_use`, `tool_result`, `turn_end`, `subagent_start`, `subagent_end`, `dialog_open`,
-  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`, `session`), `session`, `notice`.
+  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`, `session`, `unbracketed`, `command`, `control`; with
+  `action` when an interrupt, answer or model switch was refused), `session`, `notice`.
+
+Bracketed paste: tmux adds the paste markers only while the app has bracketed paste (DECSET 2004) on, and tmux 2.7
+has no format for that mode. Before a multi-line paste the core pastes `x` + DEL into the empty box: bracketed, the
+CLI inserts both (the box shows `x`, then two BSpace remove it); unbracketed, they arrive as keys and the box stays
+empty, so the send is refused as `unbracketed`.
 - CLI: `rolelive.py ROLE [--start CMD] [--tmux-session NAME]` prints events as JSON lines. Each stdin line is input,
   or `:interrupt`, `:answer ID …`, `:allow ID`, `:deny ID`, `:model M [E]`, `:effort E`, `:status`.
 
@@ -84,3 +93,6 @@ claude or T3) and `node --test t3rpc.test.mjs`.
 - After a model or effort switch the core puts `settings.json` back as it was before; a change another session wrote
   in those 2-3 s is lost too.
 - A question is answered from T3 only while the dialog box on screen shows its first question and first option.
+- The CLI clips a tall input box to its last rows and never draws the rest, so for such a paste the core can check
+  only the visible tail: a key typed in tmux just before the paste would be sent with it.
+- Slash and shell commands (`/…`, `!…`) from T3 are refused: run them in tmux.
