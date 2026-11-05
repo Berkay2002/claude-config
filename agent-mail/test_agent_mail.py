@@ -1039,6 +1039,15 @@ class SendCliTests(Base):
             self.assertIn(why, r.stderr, args)
         self.assertFalse(os.path.exists(os.path.join(self.mail, "inbox")))
 
+    def test_named_session_cannot_send_as_a_peer(self):
+        r = self.send("--from", "project-manager", "toolsmith", "go", name="concierge")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("refused", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "inbox")))
+        r = self.send("--from", "concierge", "toolsmith", "hi", name="concierge")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.inbox("toolsmith")[0]["from"], "concierge")
+
     def test_without_mail_dir_fails_cleanly(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_MAIL")}
         r = subprocess.run([sys.executable, AM, "send", "--from", "a", "b", "hi"], env=env, cwd=self.cwd,

@@ -127,7 +127,7 @@ to the history or drop a file into an inbox claiming `from: user`. Permission re
 is deliberately not declared for the same reason: every member could approve another session's tool calls.
 
 Scripts (cron jobs, hooks) send to an inbox or worker with the same delivery as the `send` tool. The sender is
-`--from NAME` or `AGENT_MAIL_NAME`; `user` is refused as sender:
+`--from NAME` or `AGENT_MAIL_NAME`; `user` is refused as sender, and a session with `AGENT_MAIL_NAME` set may only send as itself:
 
 ```
 python3.11 agent_mail.py send [--from NAME] <to> "text"
