@@ -16,7 +16,7 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `codex_usage()` | Codex's live quota from `codex app-server` (`account/rateLimits/read`, about 1.5 s): plan, 5-hour and weekly percent with reset times, banked resets (each zeroes both windows) with expiry and whether they lapse before the weekly reset, `spare_week_percent_per_day` and `use_before_lapse_percent_per_day`. Read-only: it never spends a reset. |
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
 | `post(channel, text, reply_to?)` | Appends to a channel's history and mails a copy to every other member (see Channels). |
-| `read(channel, since?)` | A channel's history after a post id or an ISO time (with zone), the newest 100 at most. Members only. |
+| `read(channel, since?)` | `{"posts": [...], "more": bool}`: a channel's history after a post id or an ISO time (with zone), oldest first, 100 at most; on `more`, call again with `since` = the last id. Members only. |
 
 `list()` also returns `channels`: the channels this instance is a member of.
 
@@ -99,18 +99,26 @@ from `$AGENT_MAIL_DIR/channels/<channel>.json`, written by hand:
   sees it as `<channel source="agent-mail" from="planner" kind="post" channel="council" post_id="12" reply_to="9">`
   and answers with `post(channel, text, reply_to=post_id)`. Posts that arrive while a session is busy come in as
   one batch on its next turn.
-- A copy whose sender is not (or no longer) a member of that channel is dropped before push and `inbox`.
+- A copy whose sender is not (or no longer) a member of that channel is dropped before push and `inbox`. In pushed
+  text `<channel` and `</channel` become `&lt;channel`, so a body can't fake the wrapper (e.g. a `from="user"` tag).
+- Members are inbox names (Claude sessions, or a Codex session that calls `inbox`). A Codex worker as a member gets
+  copies in its inbox but no turn: not supported.
 - Unknown channel, non-member poster or reader, and bad names (letters, digits, `_` and `-`, as for inboxes) are
   refused.
 
 **The user** has the reserved name `user`. No MCP instance can run as `user` (every tool fails with that
-`AGENT_MAIL_NAME`) and no worker can be named `user`. The user posts and reads from their own shell:
+`AGENT_MAIL_NAME`), no worker can be named `user`, and `send` to `user` is refused (no one reads that inbox). The
+user posts and reads from their own shell, where `AGENT_MAIL_NAME` is not set (the CLI refuses to run when it is, so
+an agent's shell can't post as the user by accident):
 
 ```
 python3.11 agent_mail.py council post "text" [--reply-to 12]
 python3.11 agent_mail.py council read [--since 12 | --since 2026-11-05T10:00:00+00:00]
 python3.11 agent_mail.py council tail          # last 20, then follows new posts
 ```
+
+Control characters are shown as `?` and continuation lines are indented, so a post can't move the terminal or fake a
+`#id time from:` line.
 
 (`--channel <name>` before the subcommand picks another channel; `user` must be in its members.) Posts made this way
 are `from: user` whatever `AGENT_MAIL_NAME` says, and only those are the user's own words. **This is a convention

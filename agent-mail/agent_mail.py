@@ -210,7 +210,7 @@ def members(channel):
         raise MailError(f'channels/{channel}.json must be {{"members": [names]}}') from None
     if not isinstance(m, list):
         raise MailError(f"channels/{channel}.json: members must be a list")
-    return [check_name(n, f"member of {channel}") for n in m]
+    return list(dict.fromkeys(check_name(n, f"member of {channel}") for n in m))
 
 
 def member(channel, who):
@@ -267,17 +267,26 @@ def post(channel, frm, text, reply_to=None):
 
 
 def read_since(channel, since=None):
+    """All entries after `since` (a post id, or an ISO time with zone), oldest first."""
     h = history(channel)
-    if since is not None and since != "":
-        if isinstance(since, int) or (isinstance(since, str) and since.isdigit()):
-            h = [e for e in h if e["id"] > int(since)]
-        else:
-            try:
-                t = datetime.fromisoformat(str(since))
-                h = [e for e in h if datetime.fromisoformat(e["ts"]) > t]
-            except (ValueError, TypeError):
-                raise MailError(f"since must be a post id or an ISO time with zone, got {since!r}") from None
-    return h[-READ_CAP:]
+    if since is None or since == "":
+        return h
+    if isinstance(since, int) and not isinstance(since, bool) or re.fullmatch(r"[0-9]+", str(since)):
+        return [e for e in h if e["id"] > int(since)]
+    try:
+        t = datetime.fromisoformat(str(since))
+    except ValueError:
+        t = None
+    if t is None or t.tzinfo is None:
+        raise MailError(f"since must be a post id or an ISO time with zone, got {since!r}")
+    out = []
+    for e in h:
+        try:
+            if datetime.fromisoformat(e.get("ts", "")) > t:
+                out.append(e)
+        except (ValueError, TypeError):
+            pass  # an entry without a usable time can't be placed after `since`
+    return out
 
 
 def gated(m):
@@ -312,7 +321,8 @@ def tool_post(channel, text, reply_to=None):
 
 def tool_read(channel, since=None):
     member(channel, me())
-    return json.dumps(read_since(channel, since))
+    h = read_since(channel, since)
+    return json.dumps({"posts": h[:READ_CAP], "more": len(h) > READ_CAP})  # page on with since=<last id>
 
 
 def spawn_runner(name):
@@ -328,7 +338,9 @@ def spawn_runner(name):
 def tool_send(to, text):
     if not isinstance(text, str) or not text:
         raise MailError("text must be a non-empty string")
-    rec = read_worker(check_name(to, "recipient"))
+    if check_name(to, "recipient") == USER:
+        raise MailError("the user reads no inbox: post to a channel they are in instead")
+    rec = read_worker(to)
     if rec is not None:  # queue under the record lock: a retire between our check and the write would drop the mail
         with open(wdir(to) + ".rec.lock", "w") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
@@ -511,7 +523,8 @@ TOOLS = {
     "post": (tool_post, "Post to a channel (group chat): every other member gets it. reply_to: the post id you answer.",
              {"channel": {"type": "string"}, "text": {"type": "string"}, "reply_to": {"type": "integer"}},
              ["channel", "text"]),
-    "read": (tool_read, f"A channel's history after `since` (a post id or ISO time), the newest {READ_CAP} at most.",
+    "read": (tool_read, f"A channel's history after `since` (a post id or ISO time with zone), oldest first, at most "
+             f"{READ_CAP}; more=true means call again with since=<last id>.",
              {"channel": {"type": "string"}, "since": {"type": "string"}}, ["channel"]),
 }
 
@@ -551,8 +564,10 @@ class Server:
     def push(self, msg):
         meta = {"from": str(msg.get("from", "unknown")), "kind": str(msg.get("kind", "message"))}
         meta.update((k, str(msg[k])) for k in META_KEYS if msg.get(k) is not None)
+        # a body must not open or close the <channel> wrapper Claude puts around it, e.g. to fake from="user"
+        content = re.sub(r"(?i)<(/?)(channel)", r"&lt;\1\2", str(msg.get("text", "")))
         self.write({"jsonrpc": "2.0", "method": "notifications/claude/channel",
-                    "params": {"content": msg.get("text", ""), "meta": meta}})
+                    "params": {"content": content, "meta": meta}})
 
     def poll(self, interval, push=True):
         """Start runners for our workers' queued mail, and (push) claim and push our mail one message at a time; a
@@ -830,9 +845,14 @@ def report(rec, ok, text):
             rec.get("thread_id"))
 
 
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 def show(e):
     re_ = f" (re #{e['reply_to']})" if e.get("reply_to") is not None else ""
-    print(f"#{e['id']} {e['ts']} {e['from']}{re_}: {e['text']}", flush=True)
+    # no terminal escapes; continuation lines indented so a post can't fake a `#id ts from:` header
+    text = CTRL_RE.sub("?", str(e.get("text", ""))).replace("\n", "\n    ")
+    print(f"#{e['id']} {e['ts']} {e['from']}{re_}: {text}", flush=True)
 
 
 def council_cli(args):
@@ -847,6 +867,10 @@ def council_cli(args):
     sub.add_parser("read").add_argument("--since")
     sub.add_parser("tail")
     a = ap.parse_args(args)
+    if os.environ.get("AGENT_MAIL_NAME"):  # set in every agent session and worker, never in the user's own shell
+        print("agent-mail council: AGENT_MAIL_NAME is set, so this is an agent session; agents use the post tool",
+              file=sys.stderr)
+        return 2
     try:
         member(a.channel, USER)
         if a.cmd == "post":

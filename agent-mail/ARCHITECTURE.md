@@ -162,7 +162,7 @@ flowchart LR
 | Unique, ordered ids | The poster holds the channel lock while it reads the last id, appends, fsyncs and mails the copies, so ids and inbox order match file order. |
 | Torn line | A reader skips a line that does not parse; a writer that finds no trailing newline starts a new line. |
 | Members | Only from `channels/<channel>.json`; the poster must be listed, and the push re-checks that the sender still is. |
-| The user | The name `user` is refused as `AGENT_MAIL_NAME` and as a worker name; only the CLI posts as `user`. Same-account convention, not a boundary. |
+| The user | The name `user` is refused as `AGENT_MAIL_NAME` and as a worker name; only the CLI posts as `user`, and it refuses to run where `AGENT_MAIL_NAME` is set (an agent's shell). Pushed text can't open or close the `<channel>` wrapper. Same-account convention, not a boundary. |
 | Push meta | `channel`, `post_id`, `reply_to` beside `from` and `kind`: identifiers only, because Claude drops meta keys with hyphens. |
 
 ## Mail folder layout
