@@ -59,7 +59,7 @@ class Fake(rolelive.LiveSession):
     def _keys(self, *keys):
         self.keys += keys
 
-    def _paste(self, text, submit=True):
+    def _paste(self, text, read=None):
         self.pasted.append(text)
         return True
 
@@ -160,6 +160,22 @@ class Send(Base):
         self.assertEqual(self.s.pasted, [])
         self.assertEqual(self.s.pane, "%3")
 
+    def test_command_lines_need_the_opt_in(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        for text in ("/compact", "!rm -rf build", "  /clear", "/compact\nmore"):
+            self.assertFalse(self.s.send(text))
+            self.assertEqual(self.s.events[-1], {"kind": "send_failed", "text": text, "reason": "command"})
+        self.assertEqual(self.s.pasted, [])
+        self.assertTrue(self.s.send("/compact", allow_command=True))
+        self.assertEqual(self.s.pasted, ["/compact"])
+
+    def test_model_and_effort_are_never_typed(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        for text in ("/model haiku", "/effort max", " /model"):
+            self.assertFalse(self.s.send(text, allow_command=True))
+            self.assertEqual(self.s.events[-1]["reason"], "command")
+        self.assertEqual(self.s.pasted, [])
+
     def test_send_absorbed_mid_turn_is_ours_and_not_expired(self):
         # Pasted while a turn runs: no user entry, a queue-operation plus a queued_command attachment instead.
         self.s.sent = [["please also check the notes file", time.time() - 100]]
@@ -179,18 +195,27 @@ class Send(Base):
 
 
 class Paste(Base):
-    """The real _paste, with tmux stubbed: the pane shows `after` once the paste is in."""
+    """The real _paste, with tmux stubbed: the pane shows `after` once the paste is in. The bracketed-paste probe
+    (x + DEL) shows "x" when the pane brackets pastes, else nothing; BSpace empties the box again."""
 
     def setUp(self):
         super().setUp()
         self.s._paste = types.MethodType(rolelive.LiveSession._paste, self.s)
         self.s._tmux = self.tmux
         self.s.scr = screen_file("screen-empty.txt")
+        self.bracketed, self.loaded, self.pastes = True, None, []
 
     def tmux(self, *args, data=None):
         self.s.keys.append(args)
-        if args[0] == "paste-buffer":
+        if args[0] == "load-buffer":
+            self.loaded = data
+        elif args[0] == "paste-buffer" and self.loaded == rolelive.PROBE:
+            self.s.scr = self.box("x") if self.bracketed else screen_file("screen-empty.txt")
+        elif args[0] == "paste-buffer":
+            self.pastes.append(self.loaded)
             self.s.scr = self.after
+        elif "BSpace" in args:
+            self.s.scr = screen_file("screen-empty.txt")
         return True
 
     def box(self, text):   # screen-empty.txt with text typed in its prompt box
@@ -209,6 +234,74 @@ class Paste(Base):
         self.after = self.box("[Pasted text #1 +29 lines]")
         self.assertTrue(self.s.send("\n".join(f"line {i}" for i in range(30))))
         self.assertTrue(self.entered())
+
+    def test_multiline_paste_is_probed_for_bracketed_paste_first(self):
+        text = "first line\n/second line starts with a slash"
+        self.after = self.box(text.replace("\n", "\n  "))
+        self.assertTrue(self.s.send(text))
+        self.assertTrue(self.entered())
+        self.assertEqual(self.pastes, [text.encode()])
+        probe = self.s.keys.index(("load-buffer", "-b", "rolelive", "-"))
+        self.assertIn(("send-keys", "-t", "%1", "BSpace", "BSpace"), self.s.keys[probe:])   # the DEL stays in the box
+
+    def test_multiline_paste_without_bracketed_paste_is_refused(self):
+        self.bracketed = False
+        text = "first line\n!rm -rf build"
+        self.assertFalse(self.s.send(text))
+        self.assertEqual(self.pastes, [])   # never typed line by line
+        self.assertFalse(self.entered())
+        self.assertEqual(self.s.kinds(), ["notice", "send_failed"])
+        self.assertEqual(self.s.events[-1], {"kind": "send_failed", "text": text, "reason": "unbracketed"})
+        self.assertEqual(self.s.sent, [])
+
+    def test_single_line_paste_is_not_probed(self):
+        self.after = self.box("hello")
+        self.assertTrue(self.s.send("hello"))
+        self.assertEqual([k for k in self.s.keys if k[0] == "load-buffer"], [("load-buffer", "-b", "rolelive", "-")])
+
+    TALL = "line 0 " + "w" * 3000 + "\nline 1 " + "v" * 3000
+
+    def test_paste_taller_than_the_pane_is_submitted(self):
+        # The CLI clips a tall box to its last rows: the head is never drawn, so neither the pane nor tmux's
+        # scrollback holds it. The box shows only a tail of the paste.
+        text = self.TALL
+        self.after = self.box("v" * 90 + "\n  " + "v" * 98 + "\n  " + "v" * 112)
+        self.assertGreater(len(text) // 98, len(screen_file("screen-empty.txt").split("\n")))   # taller than the pane
+        self.assertTrue(self.s.send(text))
+        self.assertTrue(self.entered())
+
+    def test_tall_paste_with_a_stray_key_is_not_submitted(self):
+        text = self.TALL
+        self.after = self.box("v" * 90 + "\n  " + "v" * 98 + "\n  " + "v" * 111 + "q")
+        self.assertFalse(self.s.send(text))
+        self.assertFalse(self.entered())
+        self.assertEqual(self.s.events[-1]["reason"], "draft")
+
+    QS = [{"question": "Pick a fruit for the test", "options": [{"label": "Apple"}, {"label": "Pear"}]}]
+
+    def typed_row(self, text):   # screen-question.txt with the "Type something" row selected and text typed in it
+        return (screen_file("screen-question.txt").replace("❯ 1. Apple", "  1. Apple")
+                .replace("  3. Type something.", "\x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m3. \x1b[39m" + text))
+
+    def open_question(self):
+        self.s.dialogs["q1"] = {"dialog": "question", "tool": "AskUserQuestion", "input": {"questions": self.QS},
+                                "synthetic": False}
+        self.s.scr = screen_file("screen-question.txt")
+
+    def test_free_text_answer_is_entered_when_the_row_shows_it(self):
+        self.open_question()
+        self.after = self.typed_row("mango with lime")
+        self.assertTrue(self.s.answer("q1", "mango with lime"))
+        self.assertTrue(self.entered())
+        self.assertEqual(self.s.events[-1], {"kind": "dialog_closed", "id": "q1", "by": "us"})
+
+    def test_free_text_answer_with_a_merged_key_is_not_entered(self):
+        self.open_question()
+        self.after = self.typed_row("mango with limex")
+        self.assertFalse(self.s.answer("q1", "mango with lime"))
+        self.assertFalse(self.entered())
+        self.assertIn("q1", self.s.dialogs)   # still open: answer it again, or in tmux
+        self.assertNotIn("dialog_closed", self.s.kinds())
 
     def test_keystroke_merged_into_the_paste_is_not_submitted(self):
         self.after = screen_file("screen-draft.txt")   # someone typed before Enter: the box is not just our text
@@ -344,6 +437,37 @@ class Dialogs(Base):
         self.assertTrue(wait_for(lambda: self.s.events[-1]["kind"] == "dialog_open"))
         self.assertEqual(self.s.events[-1]["tool_use_id"], "t1")
         self.assertEqual(oct(os.stat(spool).st_mode & 0o777), "0o600")
+
+
+class SessionCheck(Base):
+    """answer, set_model and interrupt run the same pre-send session check as send."""
+
+    def setUp(self):
+        super().setUp()
+        write_session(self.dir, {**self.s.live, "tmux": "test:@3.%3"})   # the session moved to another pane
+
+    def refused(self, action):
+        self.assertEqual(self.s.keys, [])
+        self.assertEqual(self.s.pasted, [])
+        self.assertEqual(self.s.events[-1], {"kind": "send_failed", "text": "", "reason": "session",
+                                             "action": action})
+
+    def test_interrupt(self):
+        self.s.interrupt()
+        self.refused("interrupt")
+
+    def test_answer(self):
+        self.s.dialogs["p1"] = {"dialog": "permission", "tool": "Bash", "input": {"command": "echo x"},
+                                "synthetic": True}
+        self.s.scr = PERMISSION_SCREEN.format(cmd="echo x")
+        self.assertFalse(self.s.answer("p1", "allow"))
+        self.refused("answer")
+        self.assertNotIn({"kind": "dialog_closed", "id": "p1", "by": "us"}, self.s.events)
+
+    def test_set_model(self):
+        self.s.scr = screen_file("screen-empty.txt")
+        self.assertFalse(self.s.set_model("haiku"))
+        self.refused("set_model")
 
 
 class Subagents(Base):

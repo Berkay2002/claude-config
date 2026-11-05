@@ -135,6 +135,23 @@ class Turns(Base):
         self.assertIn("someone has text typed in the tmux pane", f[1]["message"]["content"][0]["text"])
         self.assertIsNone(self.b.turn)
 
+    def test_unbracketed_and_command_refusals_are_explained(self):
+        for reason, why in (("unbracketed", "bracketed paste off"), ("command", "starts with / or !")):
+            self.b.on_user({"type": "user", "uuid": "t3-" + reason, "message": {"role": "user", "content": "hi"}})
+            self.ev("send_failed", text="hi", reason=reason)
+            f = self.frames()
+            self.assertIn(why, f[1]["message"]["content"][0]["text"])
+            self.assertIsNone(self.b.turn)
+
+    def test_refused_interrupt_keeps_the_t3_turn(self):
+        self.t3_turn()
+        self.frames()
+        self.ev("send_failed", text="", reason="session", action="interrupt")
+        f = self.frames()
+        self.assertIn("interrupt not applied", f[0]["message"]["content"][0]["text"])
+        self.assertNotIn("result", [x["type"] for x in f])
+        self.assertIsNotNone(self.b.turn)
+
     def test_t3_message_during_a_tmux_turn_gets_its_result(self):
         self.t3_turn()
         self.end_turn()
