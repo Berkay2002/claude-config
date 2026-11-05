@@ -999,5 +999,53 @@ class ChannelTests(Base):
         c.close()
 
 
+class SendCliTests(Base):
+    def send(self, *args, name=None):
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"}
+        if name:
+            env["AGENT_MAIL_NAME"] = name
+        return subprocess.run([sys.executable, AM, "send", *args], env=env, capture_output=True, text=True, timeout=20)
+
+    def inbox(self, who):
+        d = os.path.join(self.mail, "inbox", who, "new")
+        out = []
+        for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            with open(os.path.join(d, n)) as f:
+                out.append(json.load(f))
+        return out
+
+    def test_from_flag_delivers_like_the_send_tool(self):
+        r = self.send("--from", "nudger", "toolsmith", "hello\nworld")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("delivered to inbox toolsmith", r.stdout)
+        (m,) = self.inbox("toolsmith")
+        self.assertEqual((m["from"], m["to"], m["text"], m["kind"]), ("nudger", "toolsmith", "hello\nworld", "message"))
+
+    def test_sender_from_env(self):
+        r = self.send("toolsmith", "hi", name="cron")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.inbox("toolsmith")[0]["from"], "cron")
+
+    def test_refused_senders_and_recipients(self):
+        for args, name, why in ((["toolsmith", "hi"], None, "sender"),
+                                (["--from", "user", "toolsmith", "hi"], None, "reserved"),
+                                (["toolsmith", "hi"], "user", "reserved"),
+                                (["--from", "../x", "toolsmith", "hi"], None, "invalid"),
+                                (["--from", "a", "user", "hi"], None, "user reads no inbox"),
+                                (["--from", "a", "../x", "hi"], None, "recipient"),
+                                (["--from", "a", "toolsmith", ""], None, "non-empty")):
+            r = self.send(*args, name=name)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn(why, r.stderr, args)
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "inbox")))
+
+    def test_without_mail_dir_fails_cleanly(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_MAIL")}
+        r = subprocess.run([sys.executable, AM, "send", "--from", "a", "b", "hi"], env=env, cwd=self.cwd,
+                           capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("AGENT_MAIL_DIR", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

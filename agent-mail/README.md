@@ -126,6 +126,13 @@ between honest sessions of the same Unix account, not a security boundary**: any
 to the history or drop a file into an inbox claiming `from: user`. Permission relay (`claude/channel/permission`)
 is deliberately not declared for the same reason: every member could approve another session's tool calls.
 
+Scripts (cron jobs, hooks) send to an inbox or worker with the same delivery as the `send` tool. The sender is
+`--from NAME` or `AGENT_MAIL_NAME`; `user` is refused as sender:
+
+```
+python3.11 agent_mail.py send [--from NAME] <to> "text"
+```
+
 **History format** (`channels/<channel>.jsonl`, append-only, one JSON object per line, UTF-8), for readers such as a
 dashboard (read the file; post through the CLI, never write the file):
 
