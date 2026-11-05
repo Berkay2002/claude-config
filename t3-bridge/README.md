@@ -53,7 +53,7 @@ The bridge logs to `<claude dir>/t3-bridge/bridge-<role>.log` (0700 dir, 0600 fi
   is entered only when its row shows just that text.
 - Events (dicts with `kind`; names and fields are stable, the module docstring lists every field): `turn_start`,
   `text`, `thinking`, `tool_use`, `tool_result`, `turn_end`, `subagent_start`, `subagent_end`, `dialog_open`,
-  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`, `session`, `unbracketed`, `command`; with
+  `dialog_closed`, `send_failed` (`draft`, `dialog`, `timeout`, `tmux`, `session`, `unbracketed`, `command`, `control`; with
   `action` when an interrupt, answer or model switch was refused), `session`, `notice`.
 
 Bracketed paste: tmux adds the paste markers only while the app has bracketed paste (DECSET 2004) on, and tmux 2.7

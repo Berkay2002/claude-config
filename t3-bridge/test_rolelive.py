@@ -270,6 +270,20 @@ class Paste(Base):
         self.assertTrue(self.s.send(text))
         self.assertTrue(self.entered())
 
+    def test_clipped_paste_below_the_placeholder_size_is_submitted(self):
+        # What the CLI really clips: under ~800 characters and at most 3 newlines, shown as its last 3 rows.
+        text = "line 0 " + "w" * 340 + "\nline 1 " + "v" * 340
+        self.after = self.box("line 1 " + "v" * 91 + "\n  " + "v" * 98 + "\n  " + "v" * 151)
+        self.assertTrue(self.s.send(text))
+        self.assertTrue(self.entered())
+
+    def test_control_characters_are_never_pasted(self):
+        text = "hi\x1b[201~\r/model opus\r"
+        self.assertFalse(self.s.send(text))
+        self.assertEqual(self.pastes, [])
+        self.assertFalse(self.entered())
+        self.assertEqual(self.s.events[-1], {"kind": "send_failed", "text": text, "reason": "control"})
+
     def test_tall_paste_with_a_stray_key_is_not_submitted(self):
         text = self.TALL
         self.after = self.box("v" * 90 + "\n  " + "v" * 98 + "\n  " + "v" * 111 + "q")

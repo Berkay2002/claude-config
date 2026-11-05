@@ -27,7 +27,8 @@ Events (dicts, key "kind"; names and fields are stable, front ends map them):
                  "timeout": the text never showed up as a prompt, "tmux": tmux refused, "session": the pane no
                  longer runs the attached session under its name; the core re-resolves the role before the next send,
                  "unbracketed": a multi-line text while the pane had bracketed paste off (nothing typed),
-                 "command": the text starts with / or ! without allow_command, or is /model or /effort);
+                 "command": the text starts with / or ! without allow_command, or is /model or /effort,
+                 "control": the text holds a control character other than tab and newline: never pasted);
                  action ("interrupt" | "answer" | "set_model", text "") when the refused input was not a send
     session      session_id, pane, switched (bool)   (attach, /clear or restart)
     notice       text   (anything the core did not understand: never dropped silently)
@@ -57,6 +58,7 @@ SGR = re.compile(r"\x1b\[[0-9;:]*m")
 PASTED = re.compile(r"(?:\[Pasted text #\d+[^\]]*\]\s*)+")   # how the box shows a long paste
 DIM = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)", re.S)   # placeholder and suggestion text is dim
 PROBE = b"x\x7f"           # bracketed-paste probe: see _bracketed
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")   # every C0 control and DEL except \t \n \r
 NEVER_TYPED = re.compile(r"/(?:model|effort)(?:\s|$)")   # would save a default for every new session: see set_model
 
 
@@ -283,7 +285,11 @@ class LiveSession:
         """Paste text into the empty field that read(screen) returns (the prompt box by default) and press Enter.
         True when submitted, False when tmux refused, None when the field showed more than our paste (someone
         typed in the meantime: Enter is not pressed and the field is left as it is), "unbracketed" when a
-        multi-line text could not be pasted as one bracketed paste (nothing of it typed)."""
+        multi-line text could not be pasted as one bracketed paste (nothing of it typed), "control" when the text
+        holds a control character (an ESC[201~ would end the bracket early and turn the rest into keys)."""
+        if CONTROL.search(text):
+            self.notice(f"text with a control character (ESC, DEL, ...) is never pasted: {text[:200]!r}")
+            return "control"
         if "\n" in text or "\r" in text:
             probed = self._bracketed(read)
             if probed is not True:
@@ -318,7 +324,7 @@ class LiveSession:
             if self._settled(read) == "":
                 return True
         self.notice(f"the input box did not show only the bracketed-paste probe; message not sent, the box is left "
-                    f"as it is: {shown!r}")
+                    f"as it is and may hold the probe's x: {shown!r}")
         return None
 
     def _settled(self, read):
@@ -552,6 +558,7 @@ class LiveSession:
             self.notice(f"dialog {dialog_id} ({d['tool']}) is not on the session's screen; not answered from here")
             return False
         with self.lock:
+            turn = self.turn
             self.dialogs.pop(dialog_id, None)
             if d["synthetic"] and not d.get("tool_use_id"):
                 self.unbound[dialog_id] = (d["tool"], d["input"])
@@ -580,10 +587,11 @@ class LiveSession:
                     n = len(labels) + 1
                     self._keys(str(n))
                     if self._paste(ans, read=lambda scr, n=n: answer_field(scr, n)) is not True:
-                        with self.lock:   # not entered: the dialog stays open (earlier questions stay answered)
-                            self.dialogs[dialog_id] = d
-                            self.unbound.pop(dialog_id, None)
-                        self.notice(f"free-text answer to dialog {dialog_id} not entered; answer it again or in tmux")
+                        with self.lock:   # not entered: the dialog stays open, unless its turn ended meanwhile
+                            if self.turn is turn:
+                                self.dialogs[dialog_id] = d
+                                self.unbound.pop(dialog_id, None)
+                        self.notice(f"free-text answer to dialog {dialog_id} not entered; answer it in tmux")
                         return False
             time.sleep(0.3)
             if "Review your answers" in self.screen():

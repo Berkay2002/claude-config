@@ -136,7 +136,8 @@ class Turns(Base):
         self.assertIsNone(self.b.turn)
 
     def test_unbracketed_and_command_refusals_are_explained(self):
-        for reason, why in (("unbracketed", "bracketed paste off"), ("command", "starts with / or !")):
+        for reason, why in (("unbracketed", "bracketed paste off"), ("command", "starts with / or !"),
+                            ("control", "control character")):
             self.b.on_user({"type": "user", "uuid": "t3-" + reason, "message": {"role": "user", "content": "hi"}})
             self.ev("send_failed", text="hi", reason=reason)
             f = self.frames()
