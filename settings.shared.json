@@ -16,6 +16,10 @@
   "feedbackDrafts": "off",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
+  "hooks": {
+    "PreToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "python3.11 \"$HOME/.claude/shared/agent-mail/agent_mail.py\" decide-hook pre 2>/dev/null || true", "timeout": 2 }] }],
+    "PostToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "python3.11 \"$HOME/.claude/shared/agent-mail/agent_mail.py\" decide-hook post 2>/dev/null || true", "timeout": 2 }] }]
+  },
   "modelSettings": {
     "claude-opus-5-5": { "effortLevel": "high", "autoCompactWindow": 300000 },
     "claude-fable-5-1": { "effortLevel": "high", "autoCompactWindow": 300000 },

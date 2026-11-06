@@ -36,7 +36,8 @@ INSTRUCTIONS = ("Message other agent sessions. send(to, text) messages a Codex w
                 "from the worker (kind turn_end/error). Channels are group chats: a post arrives as "
                 "<channel source=\"agent-mail\" channel=\"council\" from=... post_id=...>; answer with "
                 "post(channel, text, reply_to=post_id); read(channel, since) gives the history. Only posts with "
-                "from=\"user\" are the user's own words.")
+                "from=\"user\" are the user's own words. decide_open/decide_close/decide_list keep what waits on the "
+                "user: open a decision for each question you ask outside a dialog, close it when it is answered or moot.")
 
 
 class MailError(Exception):
@@ -218,9 +219,10 @@ def member(channel, who):
         raise MailError(f"{who or 'unknown'} is not a member of channel {channel}")
 
 
-def history(channel):
+def read_jsonl(path):
+    """The JSON objects in an append-only file, in file order; a line cut short by a crash is skipped."""
     try:
-        with open(chan_path(channel, ".jsonl"), encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except FileNotFoundError:
         return []
@@ -229,10 +231,26 @@ def history(channel):
         try:
             e = json.loads(line)
         except ValueError:
-            continue  # a line cut short by a crash: skipped
-        if isinstance(e, dict) and isinstance(e.get("id"), int):
+            continue
+        if isinstance(e, dict):
             out.append(e)
     return out
+
+
+def append_jsonl(path, e, mode=0o666):
+    """Append one JSON line (the caller holds the file's lock); a torn last line is closed off first, then fsync."""
+    with open(os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, mode), "a+b") as f:
+        torn = False
+        if f.seek(0, os.SEEK_END):
+            f.seek(-1, os.SEEK_END)
+            torn = f.read(1) != b"\n"  # a crash cut the last line short
+        f.write((b"\n" if torn else b"") + (json.dumps(e) + "\n").encode())
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def history(channel):
+    return [e for e in read_jsonl(chan_path(channel, ".jsonl")) if isinstance(e.get("id"), int)]
 
 
 def post(channel, frm, text, reply_to=None):
@@ -252,14 +270,7 @@ def post(channel, frm, text, reply_to=None):
         e = {"id": (h[-1]["id"] if h else 0) + 1, "ts": now_iso(), "from": frm, "text": text}
         if reply_to is not None:
             e["reply_to"] = reply_to
-        with open(path, "a+b") as f:
-            torn = False
-            if f.seek(0, os.SEEK_END):
-                f.seek(-1, os.SEEK_END)
-                torn = f.read(1) != b"\n"  # a crash cut the last line short
-            f.write((b"\n" if torn else b"") + (json.dumps(e) + "\n").encode())
-            f.flush()
-            os.fsync(f.fileno())
+        append_jsonl(path, e)
         for m in mem:  # under the lock, so every inbox gets posts in id order
             if m not in (frm, USER):
                 deliver(inbox_dir(m), frm, m, text, "post", channel=channel, post_id=e["id"], reply_to=reply_to)
@@ -311,6 +322,162 @@ def my_channels():
     return out
 
 
+# ---------- decisions ----------
+
+CLOSERS = {"answer": "answered", "withdraw": "withdrawn", "expire": "expired", "supersede": "superseded"}
+OWNER_ONLY = ("withdraw", "expire", "supersede", "touch")  # `answer`: any named session that heard it
+STATUSES = ("open", *CLOSERS.values())
+ASKED_IN_RE = re.compile(r"^(window|today|council#[0-9]+)$")
+STALE_HOURS = 72
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+def dec_path(ext):
+    return os.path.join(root(), "decisions" + ext)
+
+
+def decisions():
+    """Current state per id, in open order: the open event's fields with every later event's fields over them (the
+    owner `role` stays), so a decision's status is its last closing event. `asked` is the last open or touch."""
+    out = {}
+    for e in read_jsonl(dec_path(".jsonl")):
+        i, ev = e.get("id"), e.get("event")
+        if ev == "open" and i not in out:
+            out[i] = {"status": "open", "opened": e.get("ts")}
+        if i not in out:
+            continue
+        d = out[i]
+        keep = ("event", "ts", "role") if "role" in d else ("event", "ts")
+        d.update((k, v) for k, v in e.items() if v is not None and k not in keep)
+        d["updated"] = e.get("ts")
+        if ev in ("open", "touch"):
+            d["asked"] = e.get("ts")
+        d["status"] = CLOSERS.get(ev, d["status"])
+    return out
+
+
+def with_age(d, now):
+    """Adds age_hours and stale (open over 3 days since last asked, or past a valid_until that is a date)."""
+    try:
+        age = (now - datetime.fromisoformat(d.get("asked") or "")).total_seconds() / 3600
+    except (ValueError, TypeError):
+        age = None
+    vu, past = str(d.get("valid_until") or ""), False
+    try:
+        if DATE_RE.match(vu):
+            past = datetime.fromisoformat(vu).date() < now.astimezone().date()  # stale the day after
+        elif vu:
+            t = datetime.fromisoformat(vu)
+            past = (t if t.tzinfo else t.astimezone()) < now
+    except ValueError:
+        pass  # free text such as "after the demo": never stale by date
+    stale = d["status"] == "open" and (past or (age is not None and age > STALE_HOURS))
+    return d | {"age_hours": None if age is None else round(age, 1), "stale": stale}
+
+
+def dec_append(by, build):
+    """Under the store lock: build(current states) returns the event (or raises), which is appended. Returns it."""
+    os.makedirs(root(), mode=0o700, exist_ok=True)
+    with open(os.open(dec_path(".lock"), os.O_WRONLY | os.O_CREAT, 0o600), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        e = {"ts": now_iso(), **build(decisions()), "by": by}
+        append_jsonl(dec_path(".jsonl"), {k: v for k, v in e.items() if v is not None}, 0o600)
+    return e
+
+
+def opt_str(v, what):
+    if v is not None and not isinstance(v, str):
+        raise MailError(f"{what} must be a string")
+    return v or None
+
+
+def decide_open(by, question, options=None, recommended=None, valid_until=None, asked_in=None, **extra):
+    """Opens a decision owned by `by`; the id is `<role>-<yymmdd>-<n>`, n counted per role and day under the lock."""
+    check_name(by, "owner")
+    if not isinstance(question, str) or not question.strip():
+        raise MailError("question must be a non-empty string (one plain sentence that stands on its own)")
+    if options is not None and (not isinstance(options, list) or not all(isinstance(o, str) for o in options)):
+        raise MailError("options must be a list of strings")
+    asked_in = asked_in or "window"
+    if not isinstance(asked_in, str) or not ASKED_IN_RE.match(asked_in):
+        raise MailError(f"asked_in must be window, today or council#<id>, got {asked_in!r}")
+    fields = {"role": by, "question": question, "options": options or None,
+              "recommended": opt_str(recommended, "recommended"), "asked_in": asked_in,
+              "valid_until": opt_str(valid_until, "valid_until"), **extra}
+    pre = f"{by}-{datetime.now().strftime('%y%m%d')}-"
+
+    def build(st):
+        n = max((int(i[len(pre):]) for i in st if isinstance(i, str) and i.startswith(pre) and i[len(pre):].isdigit()),
+                default=0)
+        return {"id": pre + str(n + 1), "event": "open", **fields}
+    return dec_append(by, build)["id"]
+
+
+ANSWER_WRITERS = ("mothership",)  # besides the roles: Mothership writes the answers the user clicks on its page
+
+
+def roles():
+    """The role names: ~/.claude/shared/local/roles/<role>.md, without _common.md."""
+    d = os.path.join(os.path.expanduser("~"), ".claude", "shared", "local", "roles")
+    return sorted(f[:-3] for f in os.listdir(d) if f.endswith(".md") and not f.startswith("_")) if os.path.isdir(d) else []
+
+
+def may_answer(by):
+    """An answer counts as the user's go: only roles and Mothership write one (the hook path is checked by its
+    caller). Codex workers and other named sessions are refused. Limits accidents, not a hostile same-uid process."""
+    return bool(by) and (by in ANSWER_WRITERS or by in roles()) and read_worker(by) is None
+
+
+def check_answered_in(v):
+    m = re.fullmatch(r"page|council#[0-9]+|([A-Za-z0-9][A-Za-z0-9_-]{0,63}) window", v or "")
+    if not m or (m.group(1) and m.group(1) not in roles()):
+        raise MailError(f"answered_in must be page, council#<post id> or '<role> window' for a known role, got {v!r}")
+    return v
+
+
+def decide_close(by, id, event, answer=None, answered_in=None, superseded_by=None, _hook=False, **extra):
+    check_name(by, "writer")
+    if event not in (*CLOSERS, "touch"):
+        raise MailError(f"event must be one of {(*CLOSERS, 'touch')}, got {event!r}")
+    answer = opt_str(answer, "answer")
+    if event == "answer":
+        if not answer:
+            raise MailError("an answer event needs `answer` (the user's words verbatim)")
+        if _hook:  # the dialog in this session's own window: where it was answered is not the caller's to say
+            answered_in = f"{by} window"
+        elif not may_answer(by):
+            raise MailError(f"{by} may not write answers: only a role ({', '.join(roles()) or 'none found'}), "
+                            f"{', '.join(ANSWER_WRITERS)} or the AskUserQuestion hook")
+        else:
+            answered_in = check_answered_in(opt_str(answered_in, "answered_in") or
+                                            (f"{by} window" if by in roles() else None))
+    if event == "supersede" and not opt_str(superseded_by, "superseded_by"):
+        raise MailError("a supersede event needs `superseded_by` (the id of the new decision)")
+
+    def build(st):
+        d = st.get(id)
+        if d is None:
+            raise MailError(f"unknown decision {id!r}")
+        if event in OWNER_ONLY and by != d.get("role"):
+            raise MailError(f"decision {id} belongs to {d.get('role')}; only its owner can {event} it")
+        if d["status"] != "open":
+            raise MailError(f"decision {id} is already {d['status']}")
+        if event == "supersede" and superseded_by not in st:
+            raise MailError(f"unknown decision {superseded_by!r} (superseded_by)")
+        return {"id": id, "event": event, "role": d.get("role"), "answer": answer if event == "answer" else None,
+                "answered_in": answered_in if event == "answer" else None,
+                "superseded_by": superseded_by if event == "supersede" else None, **extra}
+    return dec_append(by, build)
+
+
+def decide_list(status="open", role=None):
+    if status not in (*STATUSES, "all"):
+        raise MailError(f"status must be one of {(*STATUSES, 'all')}")
+    now = datetime.now(timezone.utc)
+    return [with_age(d, now) for d in decisions().values()
+            if (status == "all" or d["status"] == status) and (role is None or d.get("role") == role)]
+
+
 # ---------- tools ----------
 
 def tool_post(channel, text, reply_to=None):
@@ -323,6 +490,25 @@ def tool_read(channel, since=None):
     member(channel, me())
     h = read_since(channel, since)
     return json.dumps({"posts": h[:READ_CAP], "more": len(h) > READ_CAP})  # page on with since=<last id>
+
+
+def named():
+    if not me():
+        raise MailError("AGENT_MAIL_NAME is not set: this instance cannot write decisions")
+    return me()
+
+
+def tool_decide_open(question, options=None, recommended=None, valid_until=None, asked_in=None):
+    return decide_open(named(), question, options, recommended, valid_until, asked_in)
+
+
+def tool_decide_close(id, event, answer=None, answered_in=None, superseded_by=None):
+    decide_close(named(), id, event, answer, answered_in, superseded_by)
+    return f"{id}: {event} recorded"
+
+
+def tool_decide_list(status="open", role=None):
+    return json.dumps(decide_list(status, role))
 
 
 def spawn_runner(name):
@@ -526,6 +712,23 @@ TOOLS = {
     "read": (tool_read, f"A channel's history after `since` (a post id or ISO time with zone), oldest first, at most "
              f"{READ_CAP}; more=true means call again with since=<last id>.",
              {"channel": {"type": "string"}, "since": {"type": "string"}}, ["channel"]),
+    "decide_open": (tool_decide_open, "Record a question that waits on the user (one plain sentence that stands on its "
+                    "own); returns its id. asked_in: window (default), today or council#<post id). valid_until: an ISO "
+                    "date or free text. AskUserQuestion dialogs are recorded automatically by a hook.",
+                    {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}},
+                     "recommended": {"type": "string"}, "valid_until": {"type": "string"},
+                     "asked_in": {"type": "string"}}, ["question"]),
+    "decide_close": (tool_decide_close, "Close or refresh a decision. event: answer (the user's words verbatim in "
+                     "`answer`; any session that heard it), withdraw, expire, supersede (with superseded_by), touch "
+                     "(re-asked: refreshes its age). All but answer are for its owner only.",
+                     lambda: {"id": {"type": "string"},  # no `answer` offered to those who may not write one
+                              "event": {"type": "string", "enum": [e for e in (*CLOSERS, "touch")
+                                                                   if e != "answer" or may_answer(me())]},
+                              "answer": {"type": "string"}, "answered_in": {"type": "string"},
+                              "superseded_by": {"type": "string"}}, ["id", "event"]),
+    "decide_list": (tool_decide_list, "Decisions oldest first with age_hours and stale (open over 3 days, or past a "
+                    "valid_until date). status: open (default), answered, withdrawn, expired, superseded or all.",
+                    {"status": {"type": "string", "enum": [*STATUSES, "all"]}, "role": {"type": "string"}}, []),
 }
 
 
@@ -630,7 +833,8 @@ class Server:
             self.reply(rid, {})
         elif method == "tools/list":
             self.reply(rid, {"tools": [{"name": n, "description": d, "inputSchema": {
-                "type": "object", "properties": pr, "required": rq}} for n, (_, d, pr, rq) in TOOLS.items()]})
+                "type": "object", "properties": pr() if callable(pr) else pr, "required": rq}}
+                for n, (_, d, pr, rq) in TOOLS.items()]})
         elif method == "tools/call":
             try:
                 self.reply(rid, self.call(p))
@@ -893,6 +1097,168 @@ def council_cli(args):
     return 0
 
 
+def cli_sender(flag_value, flag):
+    """A script's name: the flag, or AGENT_MAIL_NAME. A named session acts only as itself; `user` is refused."""
+    own = os.environ.get("AGENT_MAIL_NAME") or ""
+    if own and flag_value is not None and flag_value != own:  # a named session never acts as a peer
+        raise MailError(f"{flag} {flag_value!r} refused: this session is {own!r} (AGENT_MAIL_NAME)")
+    frm = flag_value if flag_value is not None else own
+    if check_name(frm, f"sender ({flag} or AGENT_MAIL_NAME)") == USER:  # only the council CLI speaks as the user
+        raise MailError(f"the sender name {USER!r} is reserved for the user's own `council` CLI")
+    return frm
+
+
+def decide_cli(args):
+    """`decide open|close|list` for scripts and Mothership: the same store and rules as the decide_* tools."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="agent_mail.py decide")
+    ap.add_argument("--by", help="writer name (default: AGENT_MAIL_NAME)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("open")
+    p.add_argument("--question", required=True)
+    p.add_argument("--option", action="append", dest="options")
+    p.add_argument("--recommended")
+    p.add_argument("--valid-until")
+    p.add_argument("--asked-in")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("close")
+    p.add_argument("id")
+    p.add_argument("event", choices=[*CLOSERS, "touch"])
+    p.add_argument("--answer")
+    p.add_argument("--answered-in")
+    p.add_argument("--superseded-by")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("list")
+    p.add_argument("--status", default="open", choices=[*STATUSES, "all"])
+    p.add_argument("--role")
+    p.add_argument("--json", action="store_true")
+    a = ap.parse_args(args)
+    try:
+        root()
+        if a.cmd == "list":
+            ds = decide_list(a.status, a.role)
+            if a.json:
+                print(json.dumps(ds))
+            for d in [] if a.json else ds:
+                flag = " STALE" if d["stale"] else ""
+                q = CTRL_RE.sub("?", str(d.get("question", ""))).replace("\n", " ")
+                print(f"{d['id']}  {d['status']}{flag}  {d['age_hours']}h  {q}")
+            return 0
+        if not os.environ.get("AGENT_MAIL_NAME"):
+            raise MailError("open and close need AGENT_MAIL_NAME (the writer); only `list` works without it")
+        by = cli_sender(a.by, "--by")  # --by only as itself
+        if a.cmd == "open":
+            i = decide_open(by, a.question, a.options, a.recommended, a.valid_until, a.asked_in)
+            print(json.dumps(decisions()[i]) if a.json else i)
+        else:
+            e = decide_close(by, a.id, a.event, a.answer, a.answered_in, a.superseded_by)
+            print(json.dumps(e) if a.json else f"{a.id}: {a.event} recorded")
+    except MailError as e:
+        print(f"agent-mail decide: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+HOOK_BUDGET = 1.5  # seconds; the hook entry in settings.shared.json allows 2
+
+
+class HookTimeout(Exception):
+    pass
+
+
+def hook_root():
+    """Hooks get Claude Code's env, not the MCP server's: fall back to the dir agent-mail is registered with."""
+    if os.environ.get("AGENT_MAIL_DIR"):
+        return root()
+    cfg = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~"), ".claude.json")
+    with open(cfg) as f:
+        d = ((json.load(f).get("mcpServers") or {}).get("agent-mail") or {}).get("env", {}).get("AGENT_MAIL_DIR")
+    os.environ["AGENT_MAIL_DIR"] = d or ""
+    return root()
+
+
+def ask_hook(phase, ev):
+    """PreToolUse: one `open` per question (asked_in window), or a `touch` when this role has it open already.
+    PostToolUse: an `answer` per answered question; no answers (dismissed, failed) leaves it open."""
+    role = me()
+    qs = [q for q in ((ev.get("tool_input") or {}).get("questions") or []) if isinstance(q, dict) and q.get("question")]
+    tid = ev.get("tool_use_id")
+    answers, notes, lost = {}, {}, []
+    if phase == "post":
+        resp = ev.get("tool_response")
+        if isinstance(resp, str):
+            try:
+                resp = json.loads(resp)
+            except ValueError:
+                return  # an error text: the dialog failed
+        if not isinstance(resp, dict) or not isinstance(resp.get("answers"), dict) or not resp["answers"]:
+            return  # dismissed or failed: the decision stays open
+        answers = resp["answers"]
+        ann = resp.get("annotations")
+        notes = ann if isinstance(ann, dict) else {}
+    for q in qs:
+        text = q["question"]
+        mine = [d for d in decisions().values() if d.get("role") == role and d.get("question") == text
+                and d["status"] == "open"]
+        if phase == "pre":
+            if tid and mine and mine[-1].get("tool_use_id") == tid:
+                continue  # the same call seen twice
+            opts = q.get("options")
+            opts = opts if isinstance(opts, list) else []
+            labels = [o["label"] for o in opts if isinstance(o, dict) and isinstance(o.get("label"), str) and o["label"]]
+            if mine:
+                decide_close(role, mine[-1]["id"], "touch", tool_use_id=tid)
+            else:
+                decide_open(role, text, labels or None, next((x for x in labels if "(Recommended)" in x), None),
+                            asked_in="window", tool_use_id=tid)
+            continue
+        a = answers.get(text)
+        a = ", ".join(map(str, a)) if isinstance(a, list) else a
+        if not a:
+            continue
+        if not mine:
+            lost.append(text)  # its pre run recorded nothing (timed out?): say so in the log
+            continue
+        n = notes.get(text)
+        note = n.get("notes") if isinstance(n, dict) and isinstance(n.get("notes"), str) else None
+        decide_close(role, mine[-1]["id"], "answer", "\n".join(x for x in (str(a), note) if x), _hook=True)
+    if lost:
+        raise MailError(f"answered but no open decision of {role} for: {lost}")
+
+
+def decide_hook(phase, stdin=None):
+    """Claude Code hook for AskUserQuestion. Never blocks or slows the tool: always exit 0, nothing on stdout (a
+    PreToolUse hook's stdout can be read as a decision), a 1.5 s budget, every error logged to decide-hook.log."""
+    out, sys.stdout = sys.stdout, open(os.devnull, "w")
+
+    def alarm(*_):
+        raise HookTimeout(f"gave up after {HOOK_BUDGET} s")
+    try:
+        signal.signal(signal.SIGALRM, alarm)
+        signal.setitimer(signal.ITIMER_REAL, HOOK_BUDGET)
+        if not os.environ.get("AGENT_MAIL_NAME"):
+            return 0  # not a named session: nothing to record
+        try:
+            if phase not in ("pre", "post"):
+                raise MailError(f"decide-hook: phase must be pre or post, got {phase!r}")
+            hook_root()
+            ask_hook(phase, json.load(stdin or sys.stdin))
+        except BaseException:
+            msg = f"{now_iso()} decide-hook {phase}: {traceback.format_exc()}"
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            os.makedirs(root(), mode=0o700, exist_ok=True)
+            with open(os.open(os.path.join(root(), "decide-hook.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+                      "a") as f:
+                f.write(msg)
+    except BaseException:
+        pass  # no mail dir to log to, or the log itself failed: still never in Claude's way
+    finally:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)  # a late alarm must not escape as exit 1
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        sys.stdout = out
+    return 0
+
+
 def send_cli(args):
     """`send <to> <text>` from a script (cron, hooks): the same delivery as the MCP send tool."""
     import argparse
@@ -902,12 +1268,7 @@ def send_cli(args):
     ap.add_argument("text")
     a = ap.parse_args(args)
     try:
-        own = os.environ.get("AGENT_MAIL_NAME") or ""
-        if own and a.frm is not None and a.frm != own:  # a named session sends only as itself, never as a peer
-            raise MailError(f"--from {a.frm!r} refused: this session is {own!r} (AGENT_MAIL_NAME)")
-        frm = a.frm if a.frm is not None else own
-        if check_name(frm, "sender (--from or AGENT_MAIL_NAME)") == USER:  # only the council CLI speaks as the user
-            raise MailError(f"the sender name {USER!r} is reserved for the user's own `council` CLI")
+        frm = cli_sender(a.frm, "--from")
         root()
         os.environ["AGENT_MAIL_NAME"] = frm  # tool_send takes the sender from me()
         print(tool_send(a.to, a.text))
@@ -925,6 +1286,10 @@ def main(argv):
         return council_cli(argv[2:])
     elif cmd == "send":
         return send_cli(argv[2:])
+    elif cmd == "decide":
+        return decide_cli(argv[2:])
+    elif cmd == "decide-hook":
+        return decide_hook(argv[2] if len(argv) > 2 else None)
     elif cmd == "run" and len(argv) == 3:
         try:
             root()
@@ -934,7 +1299,8 @@ def main(argv):
             return 2
         run_worker(argv[2])
     else:
-        print("usage: agent_mail.py [serve | run <worker> | council post|read|tail | send [--from NAME] <to> <text>]", file=sys.stderr)
+        print("usage: agent_mail.py [serve | run <worker> | council post|read|tail | send [--from NAME] <to> <text> | "
+              "decide [--by NAME] open|close|list | decide-hook pre|post]", file=sys.stderr)
         return 2
     return 0
 

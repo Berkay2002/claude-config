@@ -165,6 +165,27 @@ flowchart LR
 | The user | The name `user` is refused as `AGENT_MAIL_NAME` and as a worker name; only the CLI posts as `user`, and it refuses to run where `AGENT_MAIL_NAME` is set (an agent's shell). Pushed text can't open or close the `<channel>` wrapper. Same-account convention, not a boundary. |
 | Push meta | `channel`, `post_id`, `reply_to` beside `from` and `kind`: identifiers only, because Claude drops meta keys with hyphens. |
 
+## Decisions
+
+**TL;DR:** one append-only file says what waits on the user; every writer goes through agent-mail, readers fold it.
+
+```mermaid
+flowchart LR
+    W["AskUserQuestion<br/>decide-hook pre/post"] -->|"open / touch / answer"| S
+    T["decide_open / decide_close<br/>(roles, MCP)"] --> S
+    M["decide CLI --by mothership<br/>(answer from the page)"] --> S
+    S["flock decisions.lock<br/>decisions.jsonl: append event, id assigned"]
+    S -.->|"decide_list: fold, age, stale"| R["/needs, standup, Mothership"]
+```
+
+| Concern | How it is handled |
+|---|---|
+| Unique ids | `<role>-<yymmdd>-<n>`: the writer holds the lock while it reads the file and picks the next n. |
+| Torn line | As channels: readers skip it, the next writer starts a new line. |
+| Who may close | Owner only for withdraw, expire, supersede, touch. `answer` counts as the user's go: only the AskUserQuestion hook, a role (`local/roles/<name>.md`) or `mothership`; Codex workers and other sessions are refused, and `answered_in` is checked (`page`, `council#<id>`, `<role> window`). Closed is final. |
+| Forged answers | **Accepted risk**, as in Mothership's R8/R9: every session runs as one Unix user, so any local process can append to the file, run the hook with a made-up payload or set `AGENT_MAIL_NAME` to a role. The rules stop accidents and Codex workers, not a hostile local process. |
+| Never in the way | The hook exits 0, prints nothing, stops after 1.5 s (settings timeout 2 s), logs to `decide-hook.log`. |
+
 ## Mail folder layout
 
 ```
@@ -172,6 +193,8 @@ $AGENT_MAIL_DIR/
 ├── tmp/                              each message is written here, then renamed into place
 ├── inbox/<name>/new/<ns>-<id>.json   unread
 ├── inbox/<name>/cur/                 claimed
+├── decisions.jsonl, decisions.lock  what waits on the user (append-only), its writers' lock
+├── decide-hook.log                   AskUserQuestion hook errors
 ├── channels/
 │   ├── <channel>.json                members, by hand
 │   ├── <channel>.jsonl               history, append-only
