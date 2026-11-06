@@ -1061,8 +1061,48 @@ class SendCliTests(Base):
 class DecisionTests(Base):
     """The decisions store: what waits on the user, one append-only file."""
 
+    def setUp(self):
+        super().setUp()
+        d = os.path.join(self.tmp, ".claude", "shared", "local", "roles")  # HOME is self.tmp
+        os.makedirs(d)
+        for r in ("_common", "project-manager", "pm", "shepherd", "concierge"):
+            open(os.path.join(d, r + ".md"), "w").close()
+
     def path(self):
         return os.path.join(self.mail, "decisions.jsonl")
+
+    def test_only_roles_and_mothership_write_answers(self):
+        self.as_("pm")
+        a = am.tool_decide_open("A?")
+        self.assertEqual(am.roles(), ["concierge", "pm", "project-manager", "shepherd"])  # _common is not a role
+        for who in ("builder-x", "w1"):
+            if who == "w1":
+                self.start_sync("w1")  # a Codex worker, even one named like a role, never answers
+                open(os.path.join(self.tmp, ".claude", "shared", "local", "roles", "w1.md"), "w").close()
+            self.as_(who)
+            with self.assertRaisesRegex(am.MailError, "may not write answers"):
+                am.tool_decide_close(a, "answer", answer="go", answered_in="page")
+        self.as_("shepherd")
+        for bad in ("somewhere", "nobody window", "council#x", "page2", "pm window extra"):
+            with self.assertRaisesRegex(am.MailError, "answered_in"):
+                am.tool_decide_close(a, "answer", answer="go", answered_in=bad)
+        self.as_("mothership")
+        with self.assertRaisesRegex(am.MailError, "answered_in"):
+            am.tool_decide_close(a, "answer", answer="go")  # no window of its own: it must say where
+        am.tool_decide_close(a, "answer", answer="go", answered_in="council#7")
+        d = self.lst(status="all")[0]
+        self.assertEqual((d["answer"], d["by"], d["answered_in"], d["role"]), ("go", "mothership", "council#7", "pm"))
+
+    def test_answer_not_offered_to_non_answerers(self):
+        def enum(name):
+            c = self.client(name)
+            c.init()
+            t = next(t for t in c.req("tools/list")["result"]["tools"] if t["name"] == "decide_close")
+            return t["inputSchema"]["properties"]["event"]["enum"]
+        self.assertIn("answer", enum("shepherd"))
+        self.assertIn("answer", enum("mothership"))
+        self.assertNotIn("answer", enum("builder-x"))
+        self.assertIn("withdraw", enum("builder-x"))
 
     def events(self):
         with open(self.path()) as f:
@@ -1202,7 +1242,15 @@ class DecisionTests(Base):
         r = cli("open", "--question", "From CLI?", "--option", "Yes", "--option", "No", name="pm")
         self.assertEqual(r.returncode, 0, r.stderr)
         cid = r.stdout.strip()
-        r = cli("--by", "mothership", "close", cid, "answer", "--answer", "Yes", "--answered-in", "council#4")
+        for args, name, why in ((("--by", "mothership", "close", cid, "answer", "--answer", "Yes"), None, "AGENT_MAIL_NAME"),
+                                (("open", "--question", "x"), None, "AGENT_MAIL_NAME"),
+                                (("--by", "mothership", "close", cid, "answer", "--answer", "Yes"), "pm", "refused"),
+                                (("close", cid, "answer", "--answer", "Yes"), "builder-x", "may not write answers")):
+            r = cli(*args, name=name)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn(why, r.stderr, args)
+        r = cli("--by", "mothership", "close", cid, "answer", "--answer", "Yes", "--answered-in", "council#4",
+                name="mothership")
         self.assertEqual(r.returncode, 0, r.stderr)
         r = cli("--by", "pm", "close", cid, "withdraw", name="concierge")
         self.assertEqual(r.returncode, 2)
@@ -1303,6 +1351,21 @@ class DecideHookTests(Base):
         self.hook("post", self.post([q], {"Odd?": "Ok"}, annotations=["not", "a", "dict"]))
         self.assertEqual(self.state()["Odd?"]["answer"], "Ok")
         self.assertFalse(os.path.exists(os.path.join(self.mail, "decide-hook.log")))
+
+    def test_reask_without_tool_use_id_still_touches(self):
+        self.hook("pre", self.pre([self.Q1], None))
+        self.hook("pre", self.pre([self.Q1], None))
+        self.assertEqual([e["event"] for e in self.lines()], ["open", "touch"])
+
+    def test_answer_without_open_decision_is_logged(self):
+        self.hook("post", self.post([self.Q1], {"Push it?": "Go"}))
+        with open(os.path.join(self.mail, "decide-hook.log")) as f:
+            self.assertIn("no open decision", f.read())
+
+    def test_hook_answers_without_being_a_role(self):
+        self.hook("pre", self.pre([self.Q1]))
+        self.hook("post", self.post([self.Q1], {"Push it?": "Go"}))  # pm is no role here: the hook path still answers
+        self.assertEqual(self.state()["Push it?"]["answered_in"], "pm window")
 
     def test_no_name_is_a_noop(self):
         self.hook("pre", self.pre([self.Q1]), name=None)

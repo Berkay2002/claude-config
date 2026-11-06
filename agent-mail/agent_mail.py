@@ -413,13 +413,44 @@ def decide_open(by, question, options=None, recommended=None, valid_until=None, 
     return dec_append(by, build)["id"]
 
 
-def decide_close(by, id, event, answer=None, answered_in=None, superseded_by=None, **extra):
+ANSWER_WRITERS = ("mothership",)  # besides the roles: Mothership writes the answers the user clicks on its page
+
+
+def roles():
+    """The role names: ~/.claude/shared/local/roles/<role>.md, without _common.md."""
+    d = os.path.join(os.path.expanduser("~"), ".claude", "shared", "local", "roles")
+    return sorted(f[:-3] for f in os.listdir(d) if f.endswith(".md") and not f.startswith("_")) if os.path.isdir(d) else []
+
+
+def may_answer(by):
+    """An answer counts as the user's go: only roles and Mothership write one (the hook path is checked by its
+    caller). Codex workers and other named sessions are refused. Limits accidents, not a hostile same-uid process."""
+    return bool(by) and (by in ANSWER_WRITERS or by in roles()) and read_worker(by) is None
+
+
+def check_answered_in(v):
+    m = re.fullmatch(r"page|council#[0-9]+|([A-Za-z0-9][A-Za-z0-9_-]{0,63}) window", v or "")
+    if not m or (m.group(1) and m.group(1) not in roles()):
+        raise MailError(f"answered_in must be page, council#<post id> or '<role> window' for a known role, got {v!r}")
+    return v
+
+
+def decide_close(by, id, event, answer=None, answered_in=None, superseded_by=None, _hook=False, **extra):
     check_name(by, "writer")
     if event not in (*CLOSERS, "touch"):
         raise MailError(f"event must be one of {(*CLOSERS, 'touch')}, got {event!r}")
     answer = opt_str(answer, "answer")
-    if event == "answer" and not answer:
-        raise MailError("an answer event needs `answer` (the user's words verbatim)")
+    if event == "answer":
+        if not answer:
+            raise MailError("an answer event needs `answer` (the user's words verbatim)")
+        if _hook:  # the dialog in this session's own window: where it was answered is not the caller's to say
+            answered_in = f"{by} window"
+        elif not may_answer(by):
+            raise MailError(f"{by} may not write answers: only a role ({', '.join(roles()) or 'none found'}), "
+                            f"{', '.join(ANSWER_WRITERS)} or the AskUserQuestion hook")
+        else:
+            answered_in = check_answered_in(opt_str(answered_in, "answered_in") or
+                                            (f"{by} window" if by in roles() else None))
     if event == "supersede" and not opt_str(superseded_by, "superseded_by"):
         raise MailError("a supersede event needs `superseded_by` (the id of the new decision)")
 
@@ -434,7 +465,7 @@ def decide_close(by, id, event, answer=None, answered_in=None, superseded_by=Non
         if event == "supersede" and superseded_by not in st:
             raise MailError(f"unknown decision {superseded_by!r} (superseded_by)")
         return {"id": id, "event": event, "role": d.get("role"), "answer": answer if event == "answer" else None,
-                "answered_in": (opt_str(answered_in, "answered_in") or f"{by} window") if event == "answer" else None,
+                "answered_in": answered_in if event == "answer" else None,
                 "superseded_by": superseded_by if event == "supersede" else None, **extra}
     return dec_append(by, build)
 
@@ -690,9 +721,11 @@ TOOLS = {
     "decide_close": (tool_decide_close, "Close or refresh a decision. event: answer (the user's words verbatim in "
                      "`answer`; any session that heard it), withdraw, expire, supersede (with superseded_by), touch "
                      "(re-asked: refreshes its age). All but answer are for its owner only.",
-                     {"id": {"type": "string"}, "event": {"type": "string", "enum": [*CLOSERS, "touch"]},
-                      "answer": {"type": "string"}, "answered_in": {"type": "string"},
-                      "superseded_by": {"type": "string"}}, ["id", "event"]),
+                     lambda: {"id": {"type": "string"},  # no `answer` offered to those who may not write one
+                              "event": {"type": "string", "enum": [e for e in (*CLOSERS, "touch")
+                                                                   if e != "answer" or may_answer(me())]},
+                              "answer": {"type": "string"}, "answered_in": {"type": "string"},
+                              "superseded_by": {"type": "string"}}, ["id", "event"]),
     "decide_list": (tool_decide_list, "Decisions oldest first with age_hours and stale (open over 3 days, or past a "
                     "valid_until date). status: open (default), answered, withdrawn, expired, superseded or all.",
                     {"status": {"type": "string", "enum": [*STATUSES, "all"]}, "role": {"type": "string"}}, []),
@@ -800,7 +833,8 @@ class Server:
             self.reply(rid, {})
         elif method == "tools/list":
             self.reply(rid, {"tools": [{"name": n, "description": d, "inputSchema": {
-                "type": "object", "properties": pr, "required": rq}} for n, (_, d, pr, rq) in TOOLS.items()]})
+                "type": "object", "properties": pr() if callable(pr) else pr, "required": rq}}
+                for n, (_, d, pr, rq) in TOOLS.items()]})
         elif method == "tools/call":
             try:
                 self.reply(rid, self.call(p))
@@ -1110,7 +1144,9 @@ def decide_cli(args):
                 q = CTRL_RE.sub("?", str(d.get("question", ""))).replace("\n", " ")
                 print(f"{d['id']}  {d['status']}{flag}  {d['age_hours']}h  {q}")
             return 0
-        by = cli_sender(a.by, "--by")
+        if not os.environ.get("AGENT_MAIL_NAME"):
+            raise MailError("open and close need AGENT_MAIL_NAME (the writer); only `list` works without it")
+        by = cli_sender(a.by, "--by")  # --by only as itself
         if a.cmd == "open":
             i = decide_open(by, a.question, a.options, a.recommended, a.valid_until, a.asked_in)
             print(json.dumps(decisions()[i]) if a.json else i)
@@ -1147,7 +1183,7 @@ def ask_hook(phase, ev):
     role = me()
     qs = [q for q in ((ev.get("tool_input") or {}).get("questions") or []) if isinstance(q, dict) and q.get("question")]
     tid = ev.get("tool_use_id")
-    answers, notes = {}, {}
+    answers, notes, lost = {}, {}, []
     if phase == "post":
         resp = ev.get("tool_response")
         if isinstance(resp, str):
@@ -1165,7 +1201,7 @@ def ask_hook(phase, ev):
         mine = [d for d in decisions().values() if d.get("role") == role and d.get("question") == text
                 and d["status"] == "open"]
         if phase == "pre":
-            if mine and mine[-1].get("tool_use_id") == tid:
+            if tid and mine and mine[-1].get("tool_use_id") == tid:
                 continue  # the same call seen twice
             opts = q.get("options")
             opts = opts if isinstance(opts, list) else []
@@ -1178,11 +1214,16 @@ def ask_hook(phase, ev):
             continue
         a = answers.get(text)
         a = ", ".join(map(str, a)) if isinstance(a, list) else a
-        if not a or not mine:
+        if not a:
+            continue
+        if not mine:
+            lost.append(text)  # its pre run recorded nothing (timed out?): say so in the log
             continue
         n = notes.get(text)
         note = n.get("notes") if isinstance(n, dict) and isinstance(n.get("notes"), str) else None
-        decide_close(role, mine[-1]["id"], "answer", "\n".join(x for x in (str(a), note) if x), f"{role} window")
+        decide_close(role, mine[-1]["id"], "answer", "\n".join(x for x in (str(a), note) if x), _hook=True)
+    if lost:
+        raise MailError(f"answered but no open decision of {role} for: {lost}")
 
 
 def decide_hook(phase, stdin=None):
@@ -1205,12 +1246,14 @@ def decide_hook(phase, stdin=None):
         except BaseException:
             msg = f"{now_iso()} decide-hook {phase}: {traceback.format_exc()}"
             signal.setitimer(signal.ITIMER_REAL, 0)
+            os.makedirs(root(), mode=0o700, exist_ok=True)
             with open(os.open(os.path.join(root(), "decide-hook.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
                       "a") as f:
                 f.write(msg)
     except BaseException:
         pass  # no mail dir to log to, or the log itself failed: still never in Claude's way
     finally:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)  # a late alarm must not escape as exit 1
         signal.setitimer(signal.ITIMER_REAL, 0)
         sys.stdout = out
     return 0

@@ -182,7 +182,8 @@ flowchart LR
 |---|---|
 | Unique ids | `<role>-<yymmdd>-<n>`: the writer holds the lock while it reads the file and picks the next n. |
 | Torn line | As channels: readers skip it, the next writer starts a new line. |
-| Who may close | Owner only for withdraw, expire, supersede, touch; `answer` from any named session (the user's words travel). Closed is final. |
+| Who may close | Owner only for withdraw, expire, supersede, touch. `answer` counts as the user's go: only the AskUserQuestion hook, a role (`local/roles/<name>.md`) or `mothership`; Codex workers and other sessions are refused, and `answered_in` is checked (`page`, `council#<id>`, `<role> window`). Closed is final. |
+| Forged answers | **Accepted risk**, as in Mothership's R8/R9: every session runs as one Unix user, so any local process can append to the file, run the hook with a made-up payload or set `AGENT_MAIL_NAME` to a role. The rules stop accidents and Codex workers, not a hostile local process. |
 | Never in the way | The hook exits 0, prints nothing, stops after 1.5 s (settings timeout 2 s), logs to `decide-hook.log`. |
 
 ## Mail folder layout

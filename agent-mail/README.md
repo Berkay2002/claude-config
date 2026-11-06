@@ -18,7 +18,7 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `post(channel, text, reply_to?)` | Appends to a channel's history and mails a copy to every other member (see Channels). |
 | `read(channel, since?)` | `{"posts": [...], "more": bool}`: a channel's history after a post id or an ISO time (with zone), oldest first, 100 at most; on `more`, call again with `since` = the last id. Members only. |
 | `decide_open(question, options?, recommended?, valid_until?, asked_in?)` | Records a question that waits on the user; returns its id `<role>-<yymmdd>-<n>` (see Decisions). |
-| `decide_close(id, event, answer?, answered_in?, superseded_by?)` | `answer` (any named session that heard it), `withdraw`, `expire`, `supersede` or `touch` (owner only). |
+| `decide_close(id, event, answer?, answered_in?, superseded_by?)` | `answer` (roles and `mothership` only), `withdraw`, `expire`, `supersede` or `touch` (owner only). |
 | `decide_list(status="open", role?)` | Current state of each decision, oldest first, with `age_hours` and `stale`. |
 
 `list()` also returns `channels`: the channels this instance is a member of.
@@ -159,8 +159,12 @@ verbatim), `answered_in` (`page | council#<id> | <role> window`), `superseded_by
 `tool_use_id`. Ids are assigned by agent-mail under the lock. A decision's state is its events folded in order (the
 last closing event gives its status); a torn last line is skipped. **Stale** is computed, never stored: open for
 more than 3 days since it was last asked (`open` or `touch`), or past `valid_until` when that is a date. Only the
-owner may withdraw, expire, supersede or touch; any named session may write `answer`. A closed decision takes no
-more events.
+owner may withdraw, expire, supersede or touch. An `answer` counts as the user's go, so only these write one: the
+AskUserQuestion hook (its `answered_in` is always `<this session> window`), a role (a `<name>.md` in
+`~/.claude/shared/local/roles/`, not `_common`) and `mothership`; never a Codex worker (a name with a worker record)
+or any other session, and `decide_close` does not offer `answer` to them. `answered_in` must be `page`,
+`council#<post id>` or `<role> window` for a known role (a role's default is its own window; Mothership must say).
+`by` (the writer) is stored beside `answer` (the user's words). A closed decision takes no more events.
 
 ```
 python3.11 agent_mail.py decide [--by NAME] open --question "..." [--option A --option B] [--recommended A] [--valid-until 2026-11-10] [--asked-in today]
@@ -168,8 +172,8 @@ python3.11 agent_mail.py decide [--by NAME] close <id> answer|withdraw|expire|su
 python3.11 agent_mail.py decide list [--status open|answered|withdrawn|expired|superseded|all] [--role R] [--json]
 ```
 
-`--by` works as `send --from`: only where `AGENT_MAIL_NAME` is unset (e.g. Mothership writing `--by mothership`),
-and never `user`.
+`open` and `close` need `AGENT_MAIL_NAME` (Mothership runs them with `AGENT_MAIL_NAME=mothership`); `--by` is
+accepted only when it equals that name, and `user` is refused. `list` works without a name.
 
 **AskUserQuestion hook** (`decide-hook pre|post`, registered in `settings.shared.json` for PreToolUse and
 PostToolUse with matcher `AskUserQuestion`): in a session with `AGENT_MAIL_NAME`, PreToolUse opens one decision per
