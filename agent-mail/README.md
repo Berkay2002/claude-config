@@ -2,7 +2,7 @@
 
 One stdio MCP server (`agent_mail.py`, Python 3.11 stdlib, one file) that Claude Code and Codex CLI both load. A Claude
 orchestrator uses it to start Codex workers, message them by name, and be woken by their messages and turn results,
-the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod, no hooks, no Monitor. Diagrams:
+the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod, no Monitor; one hook records AskUserQuestion dialogs as decisions. Diagrams:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Tools
@@ -17,6 +17,9 @@ the way `claude --bg` + SendMessage work between Claude sessions. No Claude mod,
 | `inbox()` | Claims and returns this instance's unread mail (for clients without push, e.g. Codex). |
 | `post(channel, text, reply_to?)` | Appends to a channel's history and mails a copy to every other member (see Channels). |
 | `read(channel, since?)` | `{"posts": [...], "more": bool}`: a channel's history after a post id or an ISO time (with zone), oldest first, 100 at most; on `more`, call again with `since` = the last id. Members only. |
+| `decide_open(question, options?, recommended?, valid_until?, asked_in?)` | Records a question that waits on the user; returns its id `<role>-<yymmdd>-<n>` (see Decisions). |
+| `decide_close(id, event, answer?, answered_in?, superseded_by?)` | `answer` (any named session that heard it), `withdraw`, `expire`, `supersede` or `touch` (owner only). |
+| `decide_list(status="open", role?)` | Current state of each decision, oldest first, with `age_hours` and `stale`. |
 
 `list()` also returns `channels`: the channels this instance is a member of.
 
@@ -146,6 +149,36 @@ dashboard (read the file; post through the CLI, never write the file):
 
 A line that does not parse (cut short by a crash) is skipped; the next post starts on a new line.
 `channels/<channel>.lock` is the writers' lock file.
+
+## Decisions (what waits on the user)
+
+One store, `$AGENT_MAIL_DIR/decisions.jsonl` (mode 600), append-only under `decisions.lock`: one event per line,
+`ts`, `id`, `event` (`open | answer | withdraw | expire | supersede | touch`), `role` (owner), `question`, `options`,
+`recommended`, `asked_in` (`window | today | council#<id>`), `valid_until` (ISO date or free text), `answer` (his words
+verbatim), `answered_in` (`page | council#<id> | <role> window`), `superseded_by`, `by` (who wrote it). The hook adds
+`tool_use_id`. Ids are assigned by agent-mail under the lock. A decision's state is its events folded in order (the
+last closing event gives its status); a torn last line is skipped. **Stale** is computed, never stored: open for
+more than 3 days since it was last asked (`open` or `touch`), or past `valid_until` when that is a date. Only the
+owner may withdraw, expire, supersede or touch; any named session may write `answer`. A closed decision takes no
+more events.
+
+```
+python3.11 agent_mail.py decide [--by NAME] open --question "..." [--option A --option B] [--recommended A] [--valid-until 2026-11-10] [--asked-in today]
+python3.11 agent_mail.py decide [--by NAME] close <id> answer|withdraw|expire|supersede|touch [--answer "..."] [--answered-in council#12] [--superseded-by <id>]
+python3.11 agent_mail.py decide list [--status open|answered|withdrawn|expired|superseded|all] [--role R] [--json]
+```
+
+`--by` works as `send --from`: only where `AGENT_MAIL_NAME` is unset (e.g. Mothership writing `--by mothership`),
+and never `user`.
+
+**AskUserQuestion hook** (`decide-hook pre|post`, registered in `settings.shared.json` for PreToolUse and
+PostToolUse with matcher `AskUserQuestion`): in a session with `AGENT_MAIL_NAME`, PreToolUse opens one decision per
+question (`asked_in` window, options from the labels, `recommended` the label with "(Recommended)"), or touches the
+one this role already has open with the same text. PostToolUse writes `answer` with the chosen label (a list of
+labels joined with `, `, plus `annotations[q].notes` if present), `answered_in` `<role> window`. No `answers` in
+`tool_response` (dismissed, failed) leaves it open. It always exits 0 with nothing on stdout, gives up after 1.5 s,
+and logs errors to `$AGENT_MAIL_DIR/decide-hook.log`. Hooks get Claude Code's env, not the MCP server's, so without
+`AGENT_MAIL_DIR` it reads the dir from the `agent-mail` entry in `~/.claude.json`.
 
 ## Permissions: workers run unsandboxed by default
 

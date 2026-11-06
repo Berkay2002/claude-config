@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import timedelta
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -221,7 +222,8 @@ class ServerTests(Base):
         c.notify("notifications/whatever")  # unknown notification: ignored, no reply
         self.assertEqual(c.req("ping")["result"], {})
         names = {t["name"] for t in c.req("tools/list")["result"]["tools"]}
-        self.assertEqual(names, {"send", "codex_start", "retire", "list", "codex_usage", "inbox", "post", "read"})
+        self.assertEqual(names, {"send", "codex_start", "retire", "list", "codex_usage", "inbox", "post", "read",
+                                 "decide_open", "decide_close", "decide_list"})
         self.assertEqual(c.req("nope")["error"]["code"], -32601)
         err, text = c.tool("send", to="x", text="hi")
         self.assertFalse(err)
@@ -1054,6 +1056,282 @@ class SendCliTests(Base):
                            capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 2)
         self.assertIn("AGENT_MAIL_DIR", r.stderr)
+
+
+class DecisionTests(Base):
+    """The decisions store: what waits on the user, one append-only file."""
+
+    def path(self):
+        return os.path.join(self.mail, "decisions.jsonl")
+
+    def events(self):
+        with open(self.path()) as f:
+            return [json.loads(x) for x in f]
+
+    def as_(self, name):
+        os.environ["AGENT_MAIL_NAME"] = name
+
+    def lst(self, **kw):
+        return json.loads(am.tool_decide_list(**kw))
+
+    def test_open_assigns_ids_and_lists_open(self):
+        self.as_("project-manager")
+        a = am.tool_decide_open("Ship it?", options=["Yes", "No"], recommended="Yes", asked_in="today")
+        b = am.tool_decide_open("Second?")
+        day = am.datetime.now().strftime("%y%m%d")
+        self.assertEqual((a, b), (f"project-manager-{day}-1", f"project-manager-{day}-2"))
+        self.as_("concierge")
+        self.assertEqual(am.tool_decide_open("Mine?"), f"concierge-{day}-1")
+        e = self.events()[0]
+        self.assertEqual({k: e[k] for k in ("id", "event", "role", "question", "options", "recommended", "asked_in", "by")},
+                         {"id": a, "event": "open", "role": "project-manager", "question": "Ship it?",
+                          "options": ["Yes", "No"], "recommended": "Yes", "asked_in": "today", "by": "project-manager"})
+        self.assertTrue(am.datetime.fromisoformat(e["ts"]).tzinfo)
+        self.assertEqual(os.stat(self.path()).st_mode & 0o777, 0o600)
+        d = self.lst(role="project-manager")[0]
+        self.assertEqual((d["id"], d["status"], d["stale"]), (a, "open", False))
+        self.assertLess(d["age_hours"], 1)
+        self.assertEqual([x["id"] for x in self.lst()], [a, b, f"concierge-{day}-1"])  # oldest first
+        self.assertEqual([x["id"] for x in self.lst(role="concierge")], [f"concierge-{day}-1"])
+
+    def test_answer_withdraw_supersede_expire(self):
+        self.as_("pm")
+        a, b, c, d = (am.tool_decide_open(q) for q in ("A?", "B?", "C?", "D?"))
+        self.as_("shepherd")  # any named session that heard the answer may write it
+        am.tool_decide_close(a, "answer", answer="Yes, go", answered_in="shepherd window")
+        self.as_("pm")
+        am.tool_decide_close(b, "withdraw")
+        am.tool_decide_close(c, "supersede", superseded_by=d)
+        am.tool_decide_close(d, "expire")
+        st = {x["id"]: x for x in self.lst(status="all")}
+        self.assertEqual([st[i]["status"] for i in (a, b, c, d)], ["answered", "withdrawn", "superseded", "expired"])
+        self.assertEqual((st[a]["answer"], st[a]["answered_in"], st[a]["by"], st[a]["role"]),
+                         ("Yes, go", "shepherd window", "shepherd", "pm"))
+        self.assertEqual(st[c]["superseded_by"], d)
+        self.assertEqual(self.lst(), [])
+        self.assertEqual([x["id"] for x in self.lst(status="answered")], [a])
+
+    def test_ownership_and_bad_closes_refused(self):
+        self.as_("pm")
+        a = am.tool_decide_open("A?")
+        self.as_("concierge")
+        for ev, kw in (("withdraw", {}), ("expire", {}), ("supersede", {"superseded_by": a}), ("touch", {})):
+            with self.assertRaisesRegex(am.MailError, "only its owner"):
+                am.tool_decide_close(a, ev, **kw)
+        self.as_("pm")
+        for args, kw, why in (((a, "answer"), {}, "answer"), ((a, "supersede"), {}, "superseded_by"),
+                              ((a, "supersede"), {"superseded_by": "nope-1"}, "unknown"),
+                              ((a, "open"), {}, "event"), (("nope-1", "withdraw"), {}, "unknown")):
+            with self.assertRaisesRegex(am.MailError, why):
+                am.tool_decide_close(*args, **kw)
+        am.tool_decide_close(a, "withdraw")
+        with self.assertRaisesRegex(am.MailError, "already withdrawn"):
+            am.tool_decide_close(a, "answer", answer="late")
+        for kw, why in (({"question": ""}, "question"), ({"question": "Q", "options": "x"}, "options"),
+                        ({"question": "Q", "asked_in": "elsewhere"}, "asked_in")):
+            with self.assertRaisesRegex(am.MailError, why):
+                am.tool_decide_open(**kw)
+        os.environ.pop("AGENT_MAIL_NAME")
+        with self.assertRaisesRegex(am.MailError, "AGENT_MAIL_NAME"):
+            am.tool_decide_open("Q?")
+        self.assertEqual(len(self.events()), 2)
+
+    def test_touch_refreshes_age(self):
+        self.as_("pm")
+        with mock.patch.object(am, "now_iso", lambda: "2026-01-01T00:00:00+00:00"):
+            b = am.tool_decide_open("Old?")
+        self.assertTrue(self.lst()[0]["stale"])
+        am.tool_decide_close(b, "touch")
+        d = self.lst()[0]
+        self.assertEqual((d["status"], d["stale"], d["opened"]), ("open", False, "2026-01-01T00:00:00+00:00"))
+
+    def test_stale_by_age_and_by_date(self):
+        self.as_("pm")
+
+        def ago(**kw):
+            return mock.patch.object(am, "now_iso", lambda: (am.datetime.now(am.timezone.utc) - timedelta(**kw)).isoformat())
+        with ago(days=3, hours=1):
+            old = am.tool_decide_open("Old?")
+        with ago(days=2):
+            young = am.tool_decide_open("Young?")
+        today = am.datetime.now().date()
+        past = am.tool_decide_open("Past?", valid_until=(today - timedelta(days=1)).isoformat())
+        fut = am.tool_decide_open("Future?", valid_until=today.isoformat())
+        text = am.tool_decide_open("Text?", valid_until="after the demo")
+        st = {x["id"]: x for x in self.lst()}
+        self.assertEqual({i: st[i]["stale"] for i in (old, young, past, fut, text)},
+                         {old: True, young: False, past: True, fut: False, text: False})
+        self.assertGreater(st[old]["age_hours"], 72)
+        self.assertNotIn("stale", self.events()[0])  # computed, never stored
+
+    def test_torn_last_line_skipped(self):
+        self.as_("pm")
+        a = am.tool_decide_open("A?")
+        with open(self.path(), "a") as f:
+            f.write('{"id": "pm-x", "event": "open", "ques')
+        self.assertEqual([x["id"] for x in self.lst()], [a])
+        b = am.tool_decide_open("B?")  # starts on a new line
+        self.assertEqual([x["id"] for x in self.lst()], [a, b])
+
+    def test_concurrent_appends_from_two_processes(self):
+        code = ("import sys; sys.path.insert(0, %r); import agent_mail as am\n"
+                "for i in range(40): am.tool_decide_open('q %%d' %% i)" % HERE)
+        ps = [subprocess.Popen([sys.executable, "-c", code], env=dict(os.environ, AGENT_MAIL_NAME="pm"))
+              for _ in range(2)]
+        for p in ps:
+            self.assertEqual(p.wait(timeout=60), 0)
+        ids = [e["id"] for e in self.events()]
+        self.assertEqual((len(ids), len(set(ids))), (80, 80))
+
+    def test_mcp_tools_and_cli(self):
+        c = self.client("pm")
+        c.init()
+        names = [t["name"] for t in c.req("tools/list")["result"]["tools"]]
+        self.assertTrue({"decide_open", "decide_close", "decide_list"} <= set(names))
+        err, did = c.tool("decide_open", question="Via MCP?", options=["a", "b"])
+        self.assertFalse(err, did)
+        err, txt = c.tool("decide_close", id=did, event="withdraw")
+        self.assertFalse(err, txt)
+        err, txt = c.tool("decide_close", id=did, event="withdraw")
+        self.assertTrue(err)
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"}
+
+        def cli(*a, name=None):
+            e = dict(env, **({"AGENT_MAIL_NAME": name} if name else {}))
+            return subprocess.run([sys.executable, AM, "decide", *a], env=e, capture_output=True, text=True, timeout=20)
+        r = cli("open", "--question", "From CLI?", "--option", "Yes", "--option", "No", name="pm")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cid = r.stdout.strip()
+        r = cli("--by", "mothership", "close", cid, "answer", "--answer", "Yes", "--answered-in", "council#4")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = cli("--by", "pm", "close", cid, "withdraw", name="concierge")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("refused", r.stderr)
+        r = cli("--by", "user", "open", "--question", "x")
+        self.assertEqual(r.returncode, 2)
+        r = cli("list", "--status", "all", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = {x["id"]: x for x in json.loads(r.stdout)}
+        self.assertEqual((st[cid]["status"], st[cid]["answer"], st[cid]["by"]), ("answered", "Yes", "mothership"))
+        r = cli("list", "--status", "all")
+        self.assertIn(cid, r.stdout)
+        self.assertIn("From CLI?", r.stdout)
+
+
+class DecideHookTests(Base):
+    """`decide-hook pre|post`: AskUserQuestion dialogs become decisions. Payloads as Claude Code sends them."""
+
+    Q1 = {"question": "Push it?", "header": "Push", "multiSelect": False,
+          "options": [{"label": "Go (Recommended)", "description": "now"}, {"label": "Wait", "description": "later"}]}
+    Q2 = {"question": "Which files?", "header": "Files", "multiSelect": True,
+          "options": [{"label": "A", "description": ""}, {"label": "B", "description": ""}]}
+
+    def store(self):
+        return os.path.join(self.mail, "decisions.jsonl")
+
+    def hook(self, phase, payload, name="pm", raw=None, env=None):
+        e = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"} if env is None else env
+        if name:
+            e["AGENT_MAIL_NAME"] = name
+        t = time.time()
+        r = subprocess.run([sys.executable, AM, "decide-hook", phase], env=e, capture_output=True, text=True,
+                           input=raw if raw is not None else json.dumps(payload), timeout=20)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+        self.assertLess(time.time() - t, 3)
+        return r
+
+    def pre(self, qs, tid="toolu_1"):
+        return {"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": qs}, "tool_use_id": tid, "permission_suggestions": None}
+
+    def post(self, qs, answers, tid="toolu_1", annotations=None):
+        resp = {"questions": qs, "answers": answers}
+        if annotations:
+            resp["annotations"] = annotations
+        return {"hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": qs}, "tool_response": resp, "tool_use_id": tid}
+
+    def state(self):
+        return {x["question"]: x for x in json.loads(am.tool_decide_list(status="all"))}
+
+    def lines(self):
+        with open(self.store()) as f:
+            return [json.loads(x) for x in f]
+
+    def test_single_question_open_then_answer(self):
+        self.hook("pre", self.pre([self.Q1]))
+        self.hook("pre", self.pre([self.Q1]))  # the same call twice: still one decision
+        d = self.state()["Push it?"]
+        self.assertEqual((d["status"], d["role"], d["asked_in"], d["options"], d["recommended"]),
+                         ("open", "pm", "window", ["Go (Recommended)", "Wait"], "Go (Recommended)"))
+        self.hook("post", self.post([self.Q1], {"Push it?": "Wait"}, annotations={"Push it?": {"notes": "after 5"}}))
+        d = self.state()["Push it?"]
+        self.assertEqual((d["status"], d["answer"], d["answered_in"], d["by"]),
+                         ("answered", "Wait\nafter 5", "pm window", "pm"))
+        self.assertEqual(len(self.lines()), 2)
+
+    def test_multiple_questions_and_multiselect(self):
+        self.hook("pre", self.pre([self.Q1, self.Q2]))
+        self.hook("post", self.post([self.Q1, self.Q2], {"Push it?": "My own words", "Which files?": ["A", "B"]}))
+        st = self.state()
+        self.assertEqual((st["Push it?"]["answer"], st["Which files?"]["answer"]), ("My own words", "A, B"))
+
+    def test_reasked_question_touches_the_open_one(self):
+        self.hook("pre", self.pre([self.Q1], "toolu_1"))
+        self.hook("pre", self.pre([self.Q1], "toolu_2"))
+        self.assertEqual([e["event"] for e in self.lines()], ["open", "touch"])
+        self.hook("post", self.post([self.Q1], {"Push it?": "Go (Recommended)"}, "toolu_2"))
+        self.assertEqual(self.state()["Push it?"]["status"], "answered")
+
+    def test_dismissed_or_failed_dialog_leaves_it_open(self):
+        self.hook("pre", self.pre([self.Q1]))
+        for resp in (None, "Error: no active turn", {"questions": [self.Q1]}, {"questions": [self.Q1], "answers": {}}):
+            p = self.post([self.Q1], {})
+            p["tool_response"] = resp
+            self.hook("post", p)
+        self.assertEqual(self.state()["Push it?"]["status"], "open")
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_odd_options_and_answers_never_raise(self):
+        q = {"question": "Odd?", "options": [{"description": "no label"}, {"label": None}, {"label": 3}, "x",
+                                             {"label": "Ok"}]}
+        self.hook("pre", self.pre([q, {"question": "Bare?", "options": "nope"}, {"header": "no question"}]))
+        st = self.state()
+        self.assertEqual((st["Odd?"]["options"], st["Odd?"].get("recommended")), (["Ok"], None))
+        self.assertNotIn("options", st["Bare?"])
+        self.hook("post", self.post([q], {"Odd?": None}, annotations={"Odd?": "not a dict"}))
+        self.hook("post", self.post([q], {"Odd?": "Ok"}, annotations=["not", "a", "dict"]))
+        self.assertEqual(self.state()["Odd?"]["answer"], "Ok")
+        self.assertFalse(os.path.exists(os.path.join(self.mail, "decide-hook.log")))
+
+    def test_no_name_is_a_noop(self):
+        self.hook("pre", self.pre([self.Q1]), name=None)
+        self.assertFalse(os.path.exists(self.mail))
+
+    def test_mail_dir_from_claude_json(self):
+        """Hooks get Claude's env, not the MCP server's: the dir comes from the agent-mail registration."""
+        with open(os.path.join(self.tmp, ".claude.json"), "w") as f:
+            json.dump({"mcpServers": {"agent-mail": {"env": {"AGENT_MAIL_DIR": self.mail}}}}, f)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_MAIL")}
+        self.hook("pre", self.pre([self.Q1]), env=env)
+        self.assertEqual(self.state()["Push it?"]["status"], "open")
+
+    def test_broken_input_and_store_still_exit_0(self):
+        self.hook("pre", None, raw="not json")
+        self.hook("bogus", self.pre([self.Q1]))
+        self.hook("pre", self.pre([self.Q1]), name="user")
+        os.makedirs(self.store())  # a directory where the store should be
+        self.hook("pre", self.pre([self.Q1]))
+        self.hook("post", self.post([self.Q1], {"Push it?": "Go"}))
+        with open(os.path.join(self.mail, "decide-hook.log")) as f:
+            self.assertIn("Error", f.read())
+
+    def test_held_lock_gives_up_within_budget(self):
+        os.makedirs(self.mail)
+        with open(os.path.join(self.mail, "decisions.lock"), "w") as lk:
+            am.fcntl.flock(lk, am.fcntl.LOCK_EX)
+            self.hook("pre", self.pre([self.Q1]))
+        self.assertFalse(os.path.exists(self.store()))
 
 
 if __name__ == "__main__":
