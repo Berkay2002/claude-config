@@ -1,0 +1,18 @@
+{
+  "enabledPlugins": {
+    "babysit-pr@berkay": true,
+    "limit-resume@berkays-mods": true,
+    "workers@berkays-mods": true,
+    "identity-keeper@berkays-mods": true,
+    "proof-gate@berkays-mods": false,
+    "effort-gate@berkays-mods": true,
+    "route-ledger@berkays-mods": true,
+    "config-sync@berkays-mods": true,
+    "savvy-progress@berkays-mods": true,
+    "cache-tax@berkays-mods": true
+  },
+  "extraKnownMarketplaces": {
+    "berkay": { "source": { "source": "github", "repo": "Berkay2002/babysit-pr" } },
+    "berkays-mods": { "source": { "source": "github", "repo": "Berkay2002/berkays-mods" } }
+  }
+}

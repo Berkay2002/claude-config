@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # Links this repo into ~/.claude and merges settings.shared.json into settings.json. Safe to re-run. Needs jq.
-# Usage (repo must be cloned to ~/.claude/shared):  ./install.sh
+# Usage (repo must be cloned to ~/.claude/shared):  ./install.sh [--with-mods] [--with-agent-mail]
+#   --with-mods        also installs the berkays-mods plugins (settings.mods.json)
+#   --with-agent-mail  also adds the agent-mail hooks and the routing gate (settings.agent-mail.json)
+# The choice is kept in local/install-extras (one word per line: mods, agent-mail), so a plain re-run keeps it;
+# delete a line there to turn that extra off again.
 # Exits 1 when a plugin could not be installed; the applied-settings marker is then not written.
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR  # always the default config, even when started from a session with a private one
 claude="$HOME/.claude"; shared="$claude/shared"
 [ "$(cd "$(dirname "$0")" && pwd -P)" = "$(cd "$shared" && pwd -P)" ] || { echo "Clone this repo to $shared first." >&2; exit 1; }
 command -v jq >/dev/null || { echo "Install jq first." >&2; exit 1; }
+extras="$shared/local/install-extras"; want_x=""
+for a in "$@"; do
+  case "$a" in
+    --with-mods) want_x+=$'mods\n' ;;
+    --with-agent-mail) want_x+=$'agent-mail\n' ;;
+    *) echo "Unknown option $a (use --with-mods, --with-agent-mail)." >&2; exit 1 ;;
+  esac
+done
 stamp="$(date +%Y%m%d-%H%M%S)"; backups="$claude/backups"
 mkdir -p "$backups" "$claude/skills"
 
@@ -16,12 +28,22 @@ if ! mkdir "$lock" 2>/dev/null; then
   if [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null || true; fi
   mkdir "$lock" 2>/dev/null || { echo "Another install is running ($lock)." >&2; exit 1; }
 fi
-trap 'rmdir "$lock" 2>/dev/null || true; [ -z "$tmp" ] || rm -f "$tmp"; [ -z "$snap" ] || rm -f "$snap"' EXIT
+trap 'rmdir "$lock" 2>/dev/null || true; [ -z "$tmp" ] || rm -f "$tmp"; [ -z "$snap" ] || rm -f "$snap"; [ -z "${eff:-}" ] || rm -f "$eff" "$eff.tmp"' EXIT
 
 # One copy of settings.shared.json for the whole run: the merge and the marker must describe the same bytes, even if a pull lands meanwhile.
 snap="$(mktemp "$claude/settings.shared.XXXXXX")"
 cp "$shared/settings.shared.json" "$snap"
 want="$(git -C "$shared" hash-object --path=settings.shared.json "$snap")"
+# Opt-in extras: recorded ones plus the flags; the marker stays the hash of settings.shared.json alone (config-sync compares that).
+if [ -n "$want_x" ]; then mkdir -p "$shared/local"; { [ -f "$extras" ] && cat "$extras"; printf '%s' "$want_x"; } | sort -u > "$extras.tmp" && mv "$extras.tmp" "$extras"; fi
+eff="$(mktemp "$claude/settings.effective.XXXXXX")"; cp "$snap" "$eff"
+for x in mods agent-mail; do
+  # shortcut: jq * replaces arrays, so no two of these files may set the same hook event; merge arrays if that changes.
+  if [ -f "$extras" ] && grep -qxF "$x" "$extras"; then
+    jq -s '.[0] * .[1]' "$eff" "$shared/settings.$x.json" > "$eff.tmp" || { echo "settings.$x.json is not valid JSON." >&2; exit 1; }
+    mv "$eff.tmp" "$eff"; echo "With $x."
+  fi
+done
 
 # 1. ~/.claude/CLAUDE.md is yours: only make sure it imports the shared rules; nothing else in it is touched.
 line='@~/.claude/shared/CLAUDE.md'; g="$claude/CLAUDE.md"
@@ -58,12 +80,12 @@ if command -v claude >/dev/null; then
       out="$(claude plugin marketplace add "$repo" </dev/null 2>&1)" && echo "Added marketplace $name" || { echo "Marketplace $name failed: $(head -n1 <<<"$out")" >&2; failed=1; }
     fi
     out="$(claude plugin marketplace update "$name" </dev/null 2>&1)" || echo "Marketplace $name update failed: $(head -n1 <<<"$out")" >&2
-  done < <(jq -r '.extraKnownMarketplaces // {} | to_entries[] | "\(.key) \(.value.source.repo)"' "$snap")
+  done < <(jq -r '.extraKnownMarketplaces // {} | to_entries[] | "\(.key) \(.value.source.repo)"' "$eff")
   have_p="$(claude plugin list --json </dev/null 2>/dev/null | jq -r '.[] | select(.scope == "user") | .id' || true)"
   while read -r id; do
     grep -qxF "$id" <<<"$have_p" && continue
     out="$(claude plugin install "$id" </dev/null 2>&1)" && echo "Installed plugin $id" || { echo "Plugin $id failed: $(head -n1 <<<"$out")" >&2; failed=1; }
-  done < <(jq -r '.enabledPlugins // {} | to_entries[] | select(.value) | .key' "$snap")
+  done < <(jq -r '.enabledPlugins // {} | to_entries[] | select(.value) | .key' "$eff")
 else
   echo "claude not on PATH: plugins not installed." >&2; failed=1
 fi
@@ -80,7 +102,7 @@ s="$claude/settings.json"
 if [ -f "$s" ]; then cp "$s" "$backups/settings.json.$stamp"; else echo '{}' > "$s"; fi
 pull="git -C \"$shared\" pull --ff-only -q"
 tmp="$(mktemp "$claude/settings.json.XXXXXX")"
-if ! jq --slurpfile sh "$snap" --arg pull "$pull" --argjson drop "$drop" '
+if ! jq --slurpfile sh "$eff" --arg pull "$pull" --argjson drop "$drop" '
   . * $sh[0]
   | del(.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, .autoCompactWindow)
   | if $drop and .hooks.SessionStart then

@@ -8,7 +8,8 @@ orchestrator) there is no push and the mail waits: call `inbox` after each step.
 ## 1. Brief
 Same rules as step 3 of SKILL.md (goal, files, test that proves it, report format), plus:
 - A Codex worker has no `SendMessage`. It reports by finishing its turn: the final message is mailed to you as
-  `turn_end`. To talk mid-turn it can call agent-mail's `send` tool (its name is its worker name). Mail between
+  `turn_end`. To talk mid-turn it can call agent-mail's `send` tool (its name is its worker name), only to ask or at a blocker,
+  never for progress updates. Mail between
   workers runs only while you (their owner) are up: your agent-mail instance starts every runner.
 - Workers run **unsandboxed by default** (`--dangerously-bypass-approvals-and-sandbox`), like our Claude workers, because
   they need network for package installs. So the brief, not the sandbox, keeps them off live systems: copy the

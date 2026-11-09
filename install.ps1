@@ -1,6 +1,11 @@
 # Links this repo into ~/.claude and merges settings.shared.json into settings.json. Safe to re-run.
-# Usage (repo must be cloned to ~/.claude/shared):  ./install.ps1
+# Usage (repo must be cloned to ~/.claude/shared):  ./install.ps1 [-WithMods] [-WithAgentMail]
+#   -WithMods        also installs the berkays-mods plugins (settings.mods.json)
+#   -WithAgentMail   also adds the agent-mail hooks and the routing gate (settings.agent-mail.json)
+# The choice is kept in local\install-extras (one word per line: mods, agent-mail), so a plain re-run keeps it;
+# delete a line there to turn that extra off again.
 # Works in Windows PowerShell 5.1 and PowerShell 7. Exits 1 when a plugin could not be installed; the applied-settings marker is then not written.
+param([switch]$WithMods, [switch]$WithAgentMail)
 $ErrorActionPreference = 'Stop'
 Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue  # always the default config, even when started from a session with a private one
 $claude = Join-Path $HOME '.claude'
@@ -25,6 +30,25 @@ Copy-Item (Join-Path $shared 'settings.shared.json') $snap -Force
 $want = ("$(git -C $shared hash-object --path=settings.shared.json $snap)").Trim()
 if ($LASTEXITCODE -ne 0 -or -not $want) { throw 'git hash-object failed on settings.shared.json.' }
 $shc = Read-Utf8 $snap | ConvertFrom-Json
+function Merge($a, $b) {
+  foreach ($p in $b.PSObject.Properties) {
+    if ($p.Value -is [pscustomobject] -and $a.($p.Name) -is [pscustomobject]) { Merge $a.($p.Name) $p.Value }
+    else { $a | Add-Member -Force -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+  }
+}
+# Opt-in extras: recorded ones plus the switches; the marker stays the hash of settings.shared.json alone (config-sync compares that).
+$extras = Join-Path $shared 'local\install-extras'
+$have = @(if (Test-Path $extras) { (Read-Utf8 $extras) -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ } })
+$add = @(if ($WithMods) { 'mods' }) + @(if ($WithAgentMail) { 'agent-mail' })
+if ($add.Count) {
+  $have = @($have + $add | Sort-Object -Unique)
+  New-Item -ItemType Directory -Force (Join-Path $shared 'local') | Out-Null
+  Write-Utf8 $extras (($have -join "`n") + "`n")
+}
+foreach ($x in 'mods', 'agent-mail') {
+  # shortcut: Merge replaces arrays, so no two of these files may set the same hook event; merge arrays if that changes.
+  if ($have -contains $x) { Merge $shc (Read-Utf8 (Join-Path $shared "settings.$x.json") | ConvertFrom-Json); Write-Host "With $x." }
+}
 
 # 1. ~/.claude/CLAUDE.md is yours: only make sure it imports the shared rules; nothing else in it is touched.
 $line = '@~/.claude/shared/CLAUDE.md'
@@ -103,12 +127,6 @@ if ($haveClaude) {
 } else { Fail 'claude not on PATH: plugins not installed.' }
 
 # 4. Settings: shared keys win, local-only keys (hooks, env, voice, ...) stay.
-function Merge($a, $b) {
-  foreach ($p in $b.PSObject.Properties) {
-    if ($p.Value -is [pscustomobject] -and $a.($p.Name) -is [pscustomobject]) { Merge $a.($p.Name) $p.Value }
-    else { $a | Add-Member -Force -NotePropertyName $p.Name -NotePropertyValue $p.Value }
-  }
-}
 $settingsPath = Join-Path $claude 'settings.json'
 $settings = if (Test-Path $settingsPath) { Copy-Item $settingsPath (Join-Path $backups "settings.json.$stamp"); Read-Utf8 $settingsPath | ConvertFrom-Json } else { [pscustomobject]@{} }
 Merge $settings $shc

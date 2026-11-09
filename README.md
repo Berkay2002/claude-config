@@ -14,14 +14,16 @@ https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 | `CLAUDE.md` | The rules: which model and effort for which job, how to split work, when to escalate, budget |
 | `agents/` | `scout` (Haiku: read, search, summarise), `scout-lead` (Sonnet: splits a big read across scouts), `builder` (Sonnet: code with a test), `reviewer` (Opus: judgement) |
 | `skills/orchestrate` | Run a feature as parallel background sessions in git worktrees, coordinated from one session |
+| `skills/tech-debt` | Gather debt (ponytail-debt, ponytail-audit, greps, issues), score it with Opus, keep a ledger per repo |
 | `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (daily `--auto` for the safe part) |
 | `settings.shared.json` | Settings merged into `~/.claude/settings.json` on every device (your other keys stay) |
 | `agent-mail/` | One MCP server that lets a Claude orchestrator start, message and retire Codex workers ([architecture](agent-mail/ARCHITECTURE.md)) |
+| `hooks/routing_gate.py` | Enforces the Budget page's `local/routing.json`: a SessionStart note with the routing table and weekly pace, and a PreToolUse gate on `Agent` and `claude --bg` launches that denies lock/override mismatches and new workers at the weekly stop; any error allows |
 | `codex/AGENTS.md` | The same rules for Codex CLI (attribution, git, worktrees, worker conduct), linked to `$CODEX_HOME/AGENTS.md` |
 | `install.sh`, `install.ps1` | Installers for macOS/Linux and Windows |
 
-It works best with the [berkays-mods](https://github.com/Berkay2002/berkays-mods) plugins, which the shared settings
-install: `effort-gate` (asks you before Opus runs at xhigh/max in a worker, and blocks a background session with no
+It works best with the [berkays-mods](https://github.com/Berkay2002/berkays-mods) plugins, which the installer adds
+with `--with-mods`: `effort-gate` (asks you before Opus runs at xhigh/max in a worker, and blocks a background session with no
 `--model`), `route-ledger` (records every worker's model, effort and outcome; `/routing-review` shows what to tune) and
 `config-sync` (keeps every device on the latest config).
 
@@ -36,6 +38,15 @@ The installer:
 - adds `@~/.claude/shared/CLAUDE.md` to the top of your `~/.claude/CLAUDE.md` and leaves the rest of that file alone;
 - links `agents/` and the skills into `~/.claude`, backing up anything it replaces into `~/.claude/backups`;
 - merges `settings.shared.json` into `~/.claude/settings.json` (shared keys win) and installs the listed plugins.
+
+Two extras are opt-in, off by default:
+- `--with-mods` (`-WithMods`): the berkays-mods and babysit-pr plugins (`settings.mods.json`).
+- `--with-agent-mail` (`-WithAgentMail`): the agent-mail decision hooks and the routing gate hooks
+  (`settings.agent-mail.json`). Register the agent-mail MCP server yourself ([agent-mail/README.md](agent-mail/README.md));
+  the Codex section of `CLAUDE.md` only applies once it is there.
+
+The choice is saved in `local/install-extras`, so a plain re-run (or `/config-sync apply`) keeps it; delete a line
+there to drop that extra from later runs (keys already merged into `settings.json` stay until you remove them).
 
 Re-running it is safe.
 

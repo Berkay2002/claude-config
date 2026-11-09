@@ -25,7 +25,7 @@ repo's rules say where).
 ## As a worker
 When another session started you (an orchestrator, through agent-mail):
 - Work only in your worktree and branch. Never merge into, rebase or push the default branch: the orchestrator merges.
-- No deploys, no live services, no shared data, no lab equipment unless your brief says so. You run without a
+- No deploys, no live services, no shared data, no real equipment unless your brief says so. You run without a
   sandbox, so your brief and the repo's AGENTS.md are what keep you off them.
 - Blocked: send the orchestrator one concrete question with agent-mail `send` and keep working on what you can.
 - Before reporting, close everything you started (servers, browsers, background shells, watchers) and check with `ps`.

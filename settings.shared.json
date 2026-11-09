@@ -16,15 +16,12 @@
   "feedbackDrafts": "off",
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
-  "hooks": {
-    "PreToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "python3.11 \"$HOME/.claude/shared/agent-mail/agent_mail.py\" decide-hook pre 2>/dev/null || true", "timeout": 2 }] }],
-    "PostToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "python3.11 \"$HOME/.claude/shared/agent-mail/agent_mail.py\" decide-hook post 2>/dev/null || true", "timeout": 2 }] }]
-  },
   "modelSettings": {
-    "claude-opus-5-5": { "effortLevel": "high", "autoCompactWindow": 300000 },
-    "claude-fable-5-1": { "effortLevel": "high", "autoCompactWindow": 300000 },
-    "claude-sonnet-5-5": { "effortLevel": "high", "autoCompactWindow": 300000 },
-    "claude-haiku-5-5": { "effortLevel": "medium", "autoCompactWindow": 180000 }
+    "claude-opus-5-5": { "effortLevel": "high", "autoCompactWindow": 372000 },
+    "claude-fable-5-1": { "effortLevel": "high", "autoCompactWindow": 372000 },
+    "claude-fable-5-2": { "effortLevel": "high", "autoCompactWindow": 372000 },
+    "claude-sonnet-5-5": { "effortLevel": "high", "autoCompactWindow": 372000 },
+    "claude-haiku-5-5": { "effortLevel": "medium", "autoCompactWindow": 372000 }
   },
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true,
@@ -32,22 +29,10 @@
     "security-guidance@claude-plugins-official": true,
     "frontend-design@claude-plugins-official": true,
     "browser-use@claude-plugins-official": true,
-    "ponytail@ponytail": true,
-    "babysit-pr@berkay": true,
-    "limit-resume@berkays-mods": true,
-    "workers@berkays-mods": true,
-    "identity-keeper@berkays-mods": true,
-    "proof-gate@berkays-mods": true,
-    "effort-gate@berkays-mods": true,
-    "route-ledger@berkays-mods": true,
-    "config-sync@berkays-mods": true,
-    "savvy-progress@berkays-mods": true,
-    "cache-tax@berkays-mods": true
+    "ponytail@ponytail": true
   },
   "extraKnownMarketplaces": {
     "claude-plugins-official": { "source": { "source": "github", "repo": "anthropics/claude-plugins-official" } },
-    "ponytail": { "source": { "source": "github", "repo": "DietrichGebert/ponytail" } },
-    "berkay": { "source": { "source": "github", "repo": "Berkay2002/babysit-pr" } },
-    "berkays-mods": { "source": { "source": "github", "repo": "Berkay2002/berkays-mods" } }
+    "ponytail": { "source": { "source": "github", "repo": "DietrichGebert/ponytail" } }
   }
 }
