@@ -4,16 +4,21 @@
   tidy.py [report]            table of every worktree and background session, with class and reason
   tidy.py --apply             remove the Safe worktrees and `claude rm` the removable sessions
   tidy.py --auto              same as --apply, quiet, for cron; appends a block to ~/.claude/tidy.log
+                              (--apply and --auto also trim rebuildable ignored dirs in idle worktrees)
+  tidy.py --pressure          hourly cron: if the roots' disk is >= pressure_percent, run --auto and prune caches
+  tidy.py disk                one line: disk use and the Ask backlog, for the standup
   tidy.py --backup PATH       Ask worktree: tag detached commits, save changes as a patch, then remove it
   tidy.py offline [--delete|--archive ID ...]   list (or delete/archive) offline Remote Control rows
 
 Never deletes a local branch itself, never touches a repo's main working tree, never deletes or archives a
 Remote Control row on its own. `claude rm` can delete a session's own worktree branch, so a session is only
 removed when that branch has nothing unpushed.
-Config: ~/.claude/tidy.json {"roots": [...], "keep": [...], "min_age_hours": 24} (created if missing).
+Config: ~/.claude/tidy.json {"roots": [...], "keep": [...], "min_age_hours": 24, "pressure_percent": 80}
+(created if missing).
 """
 import argparse
 import calendar
+import fcntl
 import json
 import os
 import re
@@ -29,6 +34,10 @@ import urllib.request
 SKIP_DIRS = {"node_modules", ".cache", ".git"}
 FINISHED = {"done", "failed", "stopped", "finished", "completed", "error", "exited", "killed"}
 API = "https://api.anthropic.com"
+# Git-ignored dirs that a sync/install rebuilds; trim deletes them in idle worktrees.
+TRIM = {".venv", "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__", ".turbo"}
+CACHES = [["uv", "cache", "prune"], ["pnpm", "store", "prune"], ["npm", "cache", "verify"],
+          ["podman", "image", "prune", "-f"]]  # podman without -a: dangling images only
 
 
 class GitError(Exception):
@@ -57,7 +66,7 @@ def human(n):
 def load_conf():
     path = home(".claude", "tidy.json")
     if not os.path.exists(path):
-        conf = {"roots": [home()], "keep": ["decl-test-nightly"], "min_age_hours": 24}
+        conf = {"roots": [home()], "keep": [], "min_age_hours": 24, "pressure_percent": 80}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             json.dump(conf, f, indent=2)
@@ -67,6 +76,7 @@ def load_conf():
     conf.setdefault("roots", [home()])
     conf.setdefault("keep", [])
     conf.setdefault("min_age_hours", 24)
+    conf.setdefault("pressure_percent", 80)
     return conf
 
 
@@ -143,6 +153,7 @@ def list_worktrees(common, anydir):
             "path": p, "real": real(p), "repo": main, "common": common, "admin": a,
             "head": it.get("HEAD", ""), "branch": it.get("branch", "").removeprefix("refs/heads/"),
             "detached": "detached" in it, "locked": locked, "lock_reason": reason,
+            "bare_repo": "bare" in items[0],  # then every checkout is "linked", the user's primary ones too
         })
     return res
 
@@ -307,12 +318,23 @@ def git_status(path):
     return tracked, untracked
 
 
-def classify(wt, conf, procs, sess, now=None):
-    """Sets wt['cls'] (keep/ask/safe) and wt['reasons']. Keep wins over Ask; any doubt is Keep or Ask."""
-    now = now or time.time()
-    p, keep, ask = wt["real"], [], []
-    exists = os.path.isdir(wt["path"])
-    if wt["locked"]:
+def lock_live(reason):
+    """False only when the lock names a pid (claude agents write "pid N start T") that is gone or was reused."""
+    m = re.fullmatch(r"claude agent \S+ \(pid (\d+) start (\d+)\)", (reason or "").strip())
+    if not m:
+        return True  # a lock without a pid was set by hand: honour it
+    try:
+        with open(f"/proc/{m[1]}/stat") as f:
+            start = f.read().rsplit(")", 1)[1].split()[19]  # field 22, starttime
+    except (OSError, IndexError):
+        return False
+    return m[2] == start
+
+
+def busy(wt, conf, procs, sess, now, dead_lock_ok=False):
+    """Reasons a worktree is in use: locked, on the keep list, a process or live session inside, recently touched."""
+    p, keep = wt["real"], []
+    if wt["locked"] and not (dead_lock_ok and not lock_live(wt["lock_reason"])):
         keep.append("locked" + (f" ({wt['lock_reason']})" if wt["lock_reason"] else ""))
     for k in conf["keep"]:
         if os.path.basename(wt["path"].rstrip("/")) == k or real(k) == p:
@@ -334,6 +356,14 @@ def classify(wt, conf, procs, sess, now=None):
         age = (now - max(mt)) / 3600 if mt else None
         if age is not None and age < conf["min_age_hours"]:
             keep.append(f"touched {age:.0f}h ago")
+    return keep
+
+
+def classify(wt, conf, procs, sess, now=None):
+    """Sets wt['cls'] (keep/ask/safe) and wt['reasons']. Keep wins over Ask; any doubt is Keep or Ask."""
+    now = now or time.time()
+    exists = os.path.isdir(wt["path"])
+    keep, ask = busy(wt, conf, procs, sess, now), []
     wt["size"] = None
     try:
         if not exists:
@@ -506,12 +536,154 @@ def act(conf, wts, srows, lines):
             lines.append(f"removed {w['path']} ({human(w['size'] or 0)})")
         except GitError as e:
             lines.append(f"failed {w['path']}: {e}")
+    trim(conf, wts, procs, sess, lines)
 
 
-def finish(lines, quiet, code):
+def recent(path, cutoff):
+    """True when any file or dir below a worktree (rebuildable dirs and .git left out) changed after cutoff."""
+    stack = [path]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                if e.name in TRIM or e.name == ".git":
+                    continue
+                try:
+                    if e.stat(follow_symlinks=False).st_mtime > cutoff:
+                        return True
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                except OSError:
+                    pass
+    return False
+
+
+def trim_dirs(path):
+    """Rebuildable dirs in a worktree that git reports as ignored and that hold no tracked file."""
+    out = git(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    res = []
+    for rel in out.split("\0"):
+        rel = rel.rstrip("/")
+        full = os.path.join(path, rel)
+        if (os.path.basename(rel) not in TRIM or os.path.islink(full) or not os.path.isdir(full)
+                or subprocess.run(["git", "-C", path, "check-ignore", "-q", "--", rel], capture_output=True).returncode
+                or git(path, "ls-files", "-z", "--", rel)):
+            continue
+        res.append(full)
+    return res
+
+
+def proc_uses(path):
+    """Pids whose executable or an absolute path in their command line lies inside path (a venv python run from
+    elsewhere, `uv run --directory <wt>`); the cwd check in busy() does not see those."""
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        args = []
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().decode("utf8", "replace").split("\0")
+            args.append(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            pass  # gone, or another user's exe: use what was read
+        if any(x.startswith("/") and inside(os.path.normpath(x), path) for x in args):
+            pids.append(int(pid))
+    return pids
+
+
+def trim(conf, wts, procs, sess, lines, now=None):
+    """Delete rebuildable ignored dirs (.venv, node_modules, caches) in idle linked worktrees of any class."""
+    now = now or time.time()
+    cutoff = now - conf["min_age_hours"] * 3600
+    for w in wts:
+        if w.get("bare_repo") or not os.path.isdir(w["path"]) or recent(w["path"], cutoff):
+            continue
+        try:
+            dirs = trim_dirs(w["path"])
+            # the safe-removal loop above can take minutes: judge each candidate on fresh state, like removal does
+            fresh = [x for x in list_worktrees(w["common"], w["repo"]) if x["real"] == w["real"]] if dirs else []
+        except GitError as e:
+            lines.append(f"trim skipped {w['path']}: {e}")
+            continue
+        if not fresh:
+            continue
+        procs, (sess, _) = proc_cwds(), sessions()
+        if procs is None or sess is None or busy(fresh[0], conf, procs, sess, now, dead_lock_ok=True) or proc_uses(w["real"]):
+            continue
+        for d in dirs:
+            size, nested = walk(d)
+            if nested or os.path.exists(os.path.join(d, ".git")):
+                lines.append(f"trim skipped {d}: holds a git repo")
+                continue
+            errs = []
+            shutil.rmtree(d, onerror=lambda fn, p, e: errs.append(p))
+            lines.append(f"trimmed {d} ({human(size)})" + (f"; partial, {len(errs)} path(s) left" if errs else ""))
+
+
+def usage(conf):
+    """(mount point, percent used as df shows it, used bytes, total bytes) of the first root's filesystem."""
+    # shortcut: only roots[0] is measured; check each root's filesystem if the roots ever span several disks.
+    p = m = real(conf["roots"][0])
+    while not os.path.ismount(m):
+        m = os.path.dirname(m)
+    du = shutil.disk_usage(p)
+    return m, du.used * 100 / (du.used + du.free), du.used, du.total
+
+
+def prune_caches():
+    res = []
+    for cmd in CACHES:
+        name = os.path.basename(cmd[0])
+        if not shutil.which(cmd[0]):
+            res.append(f"{name} missing")
+            continue
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=900)
+            res.append(f"{name} {'ok' if p.returncode == 0 else f'exit {p.returncode}'}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            res.append(f"{name} {'timeout' if isinstance(e, subprocess.TimeoutExpired) else 'failed'}")
+    return res
+
+
+def pressure(conf):
+    try:
+        m, before, _, _ = usage(conf)
+    except OSError as e:
+        return finish([f"ABORT: cannot measure the disk: {e}"], True, 1, "pressure")
+    if before < conf["pressure_percent"]:
+        return 0
+    try:
+        code = apply(conf, quiet=True)
+    except Exception as e:  # still prune caches, log and alert
+        code = 1
+        finish([f"ABORT: {type(e).__name__}: {e}"], True, 1, "auto")
+    caches = prune_caches()
+    after = usage(conf)[1]
+    finish([f"{m} {before:.0f}% -> {after:.0f}% (threshold {conf['pressure_percent']}%); caches: {', '.join(caches)}"],
+           True, code, "pressure")
+    if after >= 90:
+        with open(home(".claude", "tidy-alert.txt"), "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M')} {m} still {after:.0f}% after tidy --pressure: clean up by hand\n")
+    return code
+
+
+def disk_line(conf):
+    m, pct, used, total = usage(conf)
+    wts = scan(conf)[0]
+    ask = [w for w in wts if w["cls"] == "ask"]
+    gb = 2 ** 30
+    return (f"{m} {pct:.0f}% ({used / gb:.0f}/{total / gb:.0f} GB); "
+            f"ask backlog: {len(ask)} worktrees, {sum(w['size'] or 0 for w in ask) / gb:.1f} GB")
+
+
+def finish(lines, quiet, code, mode=None):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(home(".claude", "tidy.log"), "a") as f:
-        f.write(f"== {stamp} {'auto' if quiet else 'apply'}\n" + "".join(f"  {x}\n" for x in lines))
+        f.write(f"== {stamp} {mode or ('auto' if quiet else 'apply')}\n" + "".join(f"  {x}\n" for x in lines))
     if not quiet:
         print("\n".join(lines))
     return code
@@ -698,9 +870,10 @@ def offline(ids, delete=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs="?", default="report", choices=["report", "offline"])
+    ap.add_argument("cmd", nargs="?", default="report", choices=["report", "offline", "disk"])
     ap.add_argument("--apply", action="store_true", help="remove Safe worktrees and removable sessions")
     ap.add_argument("--auto", action="store_true", help="like --apply, quiet, logs to ~/.claude/tidy.log")
+    ap.add_argument("--pressure", action="store_true", help="if the disk is >= pressure_percent: --auto plus cache prune")
     ap.add_argument("--backup", metavar="PATH", help="back up and remove one Ask worktree")
     ap.add_argument("--fetch", action="store_true", help="git fetch --prune each repo first")
     g = ap.add_mutually_exclusive_group()
@@ -710,10 +883,21 @@ def main(argv=None):
     conf = load_conf()
     if a.cmd == "offline":
         return offline(a.delete or a.archive or [], delete=bool(a.delete))
+    if a.cmd == "disk":
+        print(disk_line(conf))
+        return 0
     if a.backup:
         return backup(conf, a.backup)
-    if a.apply or a.auto:
-        return apply(conf, quiet=a.auto)
+    if a.apply or a.auto or a.pressure:
+        # hourly --pressure and daily --auto must never remove or trim at the same time
+        lock = open(home(".claude", "tidy.lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("another tidy run is in progress", file=sys.stderr)
+            return 1
+        with lock:
+            return pressure(conf) if a.pressure else apply(conf, quiet=a.auto)
     wts, srows, _, errors = scan(conf, fetch=a.fetch)
     report(wts, srows, errors)
     return 0

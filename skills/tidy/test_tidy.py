@@ -488,6 +488,108 @@ class ReviewFindings(Base):
             self.assertIn("ABORT: GitError: boom", f.read())
 
 
+class Trim(Base):
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.repo, "node_modules"))
+        self.commit(self.repo, "node_modules/tracked.js")  # a tracked dir with a trim name: never touched
+        self.sh("git", "-C", self.repo, "push", "-q", "origin", "main")
+        self.exclude(self.repo, ".venv/")
+        self.exclude(self.repo, "__pycache__/")
+        self.usage = tidy.usage
+
+    def tearDown(self):
+        tidy.usage = self.usage
+        super().tearDown()
+
+    def venv_wt(self, name, extra=True):
+        p = self.wt(name)
+        for d in (".venv/lib", "pkg/__pycache__", ".mypy_cache"):  # .mypy_cache is not ignored: it stays
+            os.makedirs(os.path.join(p, d))
+            with open(os.path.join(p, d, "f"), "w") as f:
+                f.write("x")
+        if extra:
+            with open(os.path.join(p, "notes.txt"), "w") as f:
+                f.write("untracked work")  # makes it Ask
+        for d, ds, fs in os.walk(p):
+            for x in ds + fs:
+                os.utime(os.path.join(d, x), (OLD, OLD))
+        return p
+
+    def gone(self, p):
+        return {d: not os.path.exists(os.path.join(p, d)) for d in (".venv", "pkg/__pycache__", ".mypy_cache",
+                                                                    "node_modules/tracked.js", "notes.txt")}
+
+    def test_idle_ask_worktree_loses_only_ignored_rebuildable_dirs(self):
+        p = self.venv_wt("w")
+        os.makedirs(os.path.join(self.repo, ".venv"))
+        self.assertEqual(self.cls(p)[0], "ask")
+        code, out = self.run_main("--auto")
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(self.gone(p), {".venv": True, "pkg/__pycache__": True, ".mypy_cache": False,
+                                        "node_modules/tracked.js": False, "notes.txt": False})
+        self.assertTrue(os.path.isdir(os.path.join(self.repo, ".venv")))  # main working tree untouched
+        with open(os.path.join(os.environ["HOME"], ".claude", "tidy.log")) as f:
+            self.assertIn("trimmed " + os.path.join(p, ".venv"), f.read())
+
+    def test_busy_or_recent_worktrees_are_not_trimmed(self):
+        proc = self.venv_wt("proc")
+        self.procs.append(subprocess.Popen(["sleep", "60"], cwd=proc))
+        fresh = self.venv_wt("fresh")
+        with open(os.path.join(fresh, "notes.txt"), "w") as f:
+            f.write("edited just now")
+        live_lock = self.venv_wt("livelock")
+        pid = self.procs[0].pid
+        with open(f"/proc/{pid}/stat") as f:
+            start = f.read().rsplit(")", 1)[1].split()[19]
+        self.sh("git", "-C", self.repo, "worktree", "lock", "--reason", f"claude agent x (pid {pid} start {start})", live_lock)
+        hand_lock = self.venv_wt("handlock")
+        self.sh("git", "-C", self.repo, "worktree", "lock", "--reason", "mine (pid 4194303)", hand_lock)
+        by_arg = self.venv_wt("byarg")  # a venv python started from elsewhere
+        self.procs.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", os.path.join(by_arg, ".venv", "lib")], cwd=self.tmp))
+        nested = self.venv_wt("nested")
+        self.sh("git", "init", "-q", os.path.join(nested, ".venv", "lib", "dep"))  # a checkout inside an ignored dir
+        dead_lock = self.venv_wt("deadlock")
+        self.sh("git", "-C", self.repo, "worktree", "lock", "--reason", "claude agent y (pid 4194303 start 1)", dead_lock)
+        pinned = self.venv_wt("pinned")
+        time.sleep(0.2)
+        self.assertEqual(self.run_main("--auto")[0], 0)
+        for p in (proc, fresh, live_lock, hand_lock, pinned, by_arg, nested):
+            self.assertTrue(os.path.isdir(os.path.join(p, ".venv")), p)
+        self.assertFalse(os.path.exists(os.path.join(dead_lock, ".venv")))
+
+    def test_pressure_threshold_logs_and_alerts(self):
+        tidy.CACHES, caches = [["no-such-tool-tidy-test"]], tidy.CACHES
+        self.addCleanup(setattr, tidy, "CACHES", caches)
+        log, alert = (os.path.join(os.environ["HOME"], ".claude", f) for f in ("tidy.log", "tidy-alert.txt"))
+        p = self.venv_wt("w")
+        tidy.usage = lambda conf: ("/data", 79.6, 1, 2)
+        self.assertEqual(self.run_main("--pressure"), (0, ""))
+        self.assertFalse(os.path.exists(log))  # below the threshold: nothing runs, nothing logged
+        self.assertTrue(os.path.isdir(os.path.join(p, ".venv")))
+        vals = iter([92.0, 91.0])
+        tidy.usage = lambda conf: ("/data", next(vals), 1, 2)
+        self.assertEqual(self.run_main("--pressure"), (0, ""))
+        self.assertFalse(os.path.exists(os.path.join(p, ".venv")))
+        with open(log) as f:
+            text = f.read()
+        self.assertIn("== ", text)
+        self.assertIn("/data 92% -> 91% (threshold 80%); caches: no-such-tool-tidy-test missing", text)
+        with open(alert) as f:
+            self.assertIn("/data still 91%", f.read())
+        vals = iter([85.0, 70.0])
+        self.run_main("--pressure")
+        with open(alert) as f:
+            self.assertEqual(len(f.readlines()), 1)  # under 90% afterwards: no new alert
+
+    def test_disk_line(self):
+        self.venv_wt("w")
+        tidy.usage = lambda conf: ("/data", 71.2, 142 * 2 ** 30, 200 * 2 ** 30)
+        code, out = self.run_main("disk")
+        self.assertEqual(code, 0)
+        self.assertRegex(out.strip(), r"^/data 71% \(142/200 GB\); ask backlog: 1 worktrees, \d+\.\d GB$")
+
+
 class Offline(Base):
     def test_interactive_session_bridge_is_found(self):
         d = os.path.join(os.environ["HOME"], ".claude", "sessions")
