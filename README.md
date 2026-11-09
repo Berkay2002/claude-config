@@ -1,31 +1,29 @@
 <p align="center"><img src="assets/logo.svg" width="112" alt=""></p>
 <h1 align="center">claude-config</h1>
 
-A cost-first Claude Code setup: one Opus session plans and reviews, and hands the work to cheaper workers
-(Haiku to read, Sonnet to build, Opus only where mistakes are expensive), each at an explicit effort level.
-Install it once per device; every device then pulls the same rules, agents, skills and settings.
+A cost-first Claude Code setup: one Opus session plans and reviews, and hands the work to cheaper workers, each at an
+explicit effort level: Haiku to read, Opus at medium effort to build (Sonnet as the cheaper rung), and a reviewer one
+model up only where mistakes are expensive. Install it once per device; every device then gets the same rules, agents,
+skills and settings.
 
 A real session, sped up between the routing lines (sound on):
 
 https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 
+## What a plain install gives you
 | Path | What |
 |---|---|
-| `CLAUDE.md` | The rules: which model and effort for which job, how to split work, when to escalate, budget |
-| `agents/` | `scout` (Haiku: read, search, summarise), `scout-lead` (Sonnet: splits a big read across scouts), `builder` (Sonnet: code with a test), `reviewer` (Opus: judgement) |
+| `CLAUDE.md` | The rules: which model and effort for which job, how to split work, when to escalate, the weekly budget pace. Imported from your `~/.claude/CLAUDE.md` |
+| `agents/` | `scout` (Haiku@medium: read, search, summarise), `scout-lead` (Sonnet@medium: splits a big read across scouts), `builder` (Opus@medium: code with a test), `reviewer` (Opus@medium: judgement) |
 | `skills/orchestrate` | Run a feature as parallel background sessions in git worktrees, coordinated from one session |
-| `skills/tech-debt` | Gather debt (ponytail-debt, ponytail-audit, greps, issues), score it with Opus, keep a ledger per repo |
-| `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (daily `--auto` for the safe part) |
-| `settings.shared.json` | Settings merged into `~/.claude/settings.json` on every device (your other keys stay) |
-| `agent-mail/` | One MCP server that lets a Claude orchestrator start, message and retire Codex workers ([architecture](agent-mail/ARCHITECTURE.md)) |
-| `hooks/routing_gate.py` | Enforces the Budget page's `local/routing.json`: a SessionStart note with the routing table and weekly pace, and a PreToolUse gate on `Agent` and `claude --bg` launches that denies lock/override mismatches and new workers at the weekly stop; any error allows |
-| `codex/AGENTS.md` | The same rules for Codex CLI (attribution, git, worktrees, worker conduct), linked to `$CODEX_HOME/AGENTS.md` |
+| `skills/tech-debt` | Gather debt (ponytail-debt, ponytail-audit, greps, open issues), score it with one `reviewer`, keep a ledger per repo |
+| `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (`--auto` does the safe part, e.g. from a daily cron job) |
+| `settings.shared.json` | Settings merged into `~/.claude/settings.json` (most of your other keys stay, see Install): auto permission mode, Concise output style, a default effort and a 372K auto-compact window per model, and a few plugins (from `claude-plugins-official`, plus `ponytail`) |
 | `install.sh`, `install.ps1` | Installers for macOS/Linux and Windows |
 
-It works best with the [berkays-mods](https://github.com/Berkay2002/berkays-mods) plugins, which the installer adds
-with `--with-mods`: `effort-gate` (asks you before Opus runs at xhigh/max in a worker, and blocks a background session with no
-`--model`), `route-ledger` (records every worker's model, effort and outcome; `/routing-review` shows what to tune) and
-`config-sync` (keeps every device on the latest config).
+Everything else in the repo (`agent-mail/`, `hooks/`, `codex/`, `t3-bridge/`, `skills/needs`, `skills/standup`,
+`settings.mods.json`, `settings.agent-mail.json`) is optional, see [Optional extras](#optional-extras). A plain install
+does not use it.
 
 ## Install
 Needs Claude Code, git and, on macOS/Linux, `jq`.
@@ -36,41 +34,68 @@ git clone https://github.com/Berkay2002/claude-config ~/.claude/shared
 ```
 The installer:
 - adds `@~/.claude/shared/CLAUDE.md` to the top of your `~/.claude/CLAUDE.md` and leaves the rest of that file alone;
-- links `agents/` and the skills into `~/.claude`, backing up anything it replaces into `~/.claude/backups`;
-- merges `settings.shared.json` into `~/.claude/settings.json` (shared keys win) and installs the listed plugins.
+- links `agents/` and the skills `orchestrate`, `tech-debt` and `tidy` into `~/.claude` (junctions on Windows),
+  backing up anything it replaces into `~/.claude/backups`;
+- registers the plugin marketplaces and installs the plugins listed in `settings.shared.json`;
+- merges `settings.shared.json` into `~/.claude/settings.json` (shared keys win; it also removes a global
+  `autoCompactWindow` / `env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which would override the per-model windows) and, only if every plugin installed,
+  writes `~/.claude/claude-config.installed`, the hash of the `settings.shared.json` it applied.
 
-Two extras are opt-in, off by default:
-- `--with-mods` (`-WithMods`): the berkays-mods and babysit-pr plugins (`settings.mods.json`).
-- `--with-agent-mail` (`-WithAgentMail`): the agent-mail decision hooks and the routing gate hooks
-  (`settings.agent-mail.json`). Register the agent-mail MCP server yourself ([agent-mail/README.md](agent-mail/README.md));
-  the Codex section of `CLAUDE.md` only applies once it is there.
-
-The choice is saved in `local/install-extras`, so a plain re-run (or `/config-sync apply`) keeps it; delete a line
-there to drop that extra from later runs (keys already merged into `settings.json` stay until you remove them).
-
-Re-running it is safe.
+Re-running it is safe; a lock (`~/.claude/.install.lock`) keeps two runs from overlapping.
 
 ## Make it yours
 - Notes about one machine (drives, toolchains, servers, where repos live, your plans) go in `local/` of this clone,
-  which is gitignored by design, so a pull never touches them and they are never pushed:
-  - `local/CLAUDE.md` is imported at the end of the shared rules when it exists.
-  - `local/AGENTS.md` is linked (copied on Windows) to `$CODEX_HOME/AGENTS.local.md`, which the shared Codex rules
-    tell Codex to read.
-  Your own `~/.claude/CLAUDE.md` below the import line works too and is not synced either.
+  which is gitignored, so a pull never touches them and they are never pushed. `local/CLAUDE.md` is imported at the
+  end of the shared rules when it exists. Your own `~/.claude/CLAUDE.md` below the import line works too and is not
+  synced either.
 - Rules for one project go in that project's own `CLAUDE.md`.
-- To change the shared rules, fork this repo, edit, push, and install from your fork.
-  Shared settings you don't want (theme, output style, plugins) can be removed from `settings.shared.json` in your fork.
+- To change the shared rules, fork this repo, edit, push, and install from your fork. Shared settings you don't want
+  (theme, output style, plugins) can be removed from `settings.shared.json` in your fork.
 
 ## Sync
-The `config-sync` mod (`config-sync@berkays-mods`) pulls this repo (`--ff-only`) at session start, at most once per 10 minutes per device. It tells you when the pull fails, when this clone has unpushed or uncommitted changes, and when `settings.shared.json` no longer matches `~/.claude/claude-config.installed` ("Shared settings changed: run /config-sync apply"). A state is announced when it appears or changes, and again at most once a day while it persists.
-- `/config-sync` shows the last pull, the settings hash (installed vs current) and local changes.
-- `/config-sync apply` runs the installer. The mod never runs it on its own.
-
-The installer takes a lock (`~/.claude/.install.lock`), registers and updates the marketplaces, installs the missing user-scope plugins from `settings.shared.json`, merges the settings, and writes the marker last, only if every plugin installed. It only makes sure `~/.claude/CLAUDE.md` contains the line `@~/.claude/shared/CLAUDE.md` (prepending it if missing); the rest of that file is yours. It drops the old SessionStart `git pull` hook only once `config-sync@berkays-mods` is installed and has pulled at least once.
-
-Without the mod, run `git -C ~/.claude/shared pull` and the installer yourself.
+Pull and re-run the installer on each device:
+```sh
+git -C ~/.claude/shared pull --ff-only && ~/.claude/shared/install.sh
+```
+The `config-sync` mod (one of the [optional mods](#optional-extras)) does the pull for you at session start and keeps
+reporting changes until `~/.claude/claude-config.installed` matches `settings.shared.json`; `/config-sync apply` runs
+the installer. Once that mod is installed and has pulled at least once, the installer drops an old SessionStart
+`git pull` hook from `settings.json` if you still have one.
 
 Not synced: `~/.claude.json` (MCP servers, login), credentials, and anything in your own `~/.claude/CLAUDE.md`.
+
+## Optional extras
+These are the author's own multi-session setup. Nobody needs them; the rules in `CLAUDE.md` that depend on them say
+"when installed" and are skipped otherwise. Two of them are installer flags:
+```sh
+~/.claude/shared/install.sh --with-mods --with-agent-mail     # Windows: install.ps1 -WithMods -WithAgentMail
+```
+The choice is saved in `local/install-extras` (one word per line), so a plain re-run keeps it. Delete a line there
+and re-run to turn that extra off: the installer then stops merging its settings and removes the `needs`/`standup`
+links it made; keys already merged into `settings.json` and the Codex rules in `$CODEX_HOME` stay until you remove
+them.
+
+- **Mods** (`--with-mods`, `settings.mods.json`): the [berkays-mods](https://github.com/Berkay2002/berkays-mods)
+  plugins and `babysit-pr`. Among them `effort-gate` (asks you before Opus runs at xhigh/max in a worker, and blocks a
+  background session with no `--model`), `route-ledger` (records every worker's model, effort and outcome;
+  `/routing-review` shows what to tune), `limit-resume` (shows the 5-hour usage each turn and resumes long unattended
+  runs after the reset) and `config-sync` (see [Sync](#sync)).
+- **agent-mail** (`--with-agent-mail`, `settings.agent-mail.json`), which brings:
+  - the agent-mail hooks, which record AskUserQuestion dialogs as decisions and, in quiet hours, queue the questions
+    and drop push notifications;
+  - the routing gate (`hooks/routing_gate.py`): a SessionStart note with the routing table and weekly pace, and a
+    PreToolUse gate on `Agent` and `claude --bg` launches that denies a launch breaking a lock or override in
+    `local/routing.json` (built-in defaults when that file is missing), and new workers at the weekly stop;
+  - Codex workers: `codex/AGENTS.md` (the same rules for Codex CLI) linked to `$CODEX_HOME/AGENTS.md` (copied on
+    Windows) when that folder exists, and `local/AGENTS.md` to `$CODEX_HOME/AGENTS.local.md` when you have one;
+  - the `needs` skill (what a session is waiting on you for) and the `standup` skill (a morning status from
+    long-running role sessions), which both work through agent-mail.
+
+  The hooks call `python3.11` by name and do nothing when it is missing. The MCP server itself you register by hand:
+  [agent-mail/README.md](agent-mail/README.md), [architecture](agent-mail/ARCHITECTURE.md).
+- **T3 bridge** (`t3-bridge/`, no installer flag): use T3 Code as a front end for a live role session running in tmux.
+  It patches a `claude-role` launcher that is not part of this repo. See [t3-bridge/README.md](t3-bridge/README.md)
+  and [t3-bridge/INSTALL.md](t3-bridge/INSTALL.md).
 
 ## Benchmarks behind the routing
 The routing in `CLAUDE.md` is derived from these. Directional only: real outcomes (`/routing-review`) win.

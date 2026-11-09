@@ -1,15 +1,15 @@
 ---
 name: tidy
-description: Clean up git worktrees, finished background sessions and offline Remote Control rows without losing work. Use whenever the user says "clean up worktrees", "tidy", "/tidy", "too many agents", "too many sessions", "disk full", "/repo is full", "ListAgents shows old sessions", "offline Remote Control rows", or asks what is safe to delete; and after every orchestrator round (orchestrate step 6.5 / Housekeeping), even when nobody asked.
+description: Clean up git worktrees, finished background sessions and offline Remote Control rows without losing work. Use whenever the user says "clean up worktrees", "tidy", "/tidy", "too many agents", "too many sessions", "disk full", "ListAgents shows old sessions", "offline Remote Control rows", or asks what is safe to delete; and after every orchestrator round (orchestrate step 6.5 / Housekeeping), even when nobody asked.
 ---
 
 # Tidy worktrees and sessions
 
-One script does the checking: `/usr/bin/python3.11 ~/.claude/skills/tidy/tidy.py` (stdlib only; the system
-`python3` is too old). It never deletes a local branch itself (`claude rm` may drop a session's own worktree branch,
+One script does the checking: `python3 ~/.claude/skills/tidy/tidy.py` (stdlib only, Python 3.9 or newer; where the
+system `python3` is older, run it with a newer interpreter by its full path). It never deletes a local branch itself (`claude rm` may drop a session's own worktree branch,
 so it only runs when that branch has nothing unpushed), never touches a repo's main working tree, and treats any
-doubt as Keep or Ask. A daily cron runs `--auto`, which removes the Safe worktrees and trims idle ones; this skill
-is for the rest.
+doubt as Keep or Ask. `--auto` (meant for a daily cron job) removes the Safe worktrees and trims idle ones; this
+skill is for the rest.
 
 ## 1. Report
 `tidy.py report` (add `--fetch` to refresh remote-tracking refs first). Every worktree under the roots in
@@ -34,11 +34,11 @@ are ignored and hold no tracked file: `.venv`, `node_modules`, `.pytest_cache`, 
 `__pycache__`, `.turbo`. Rebuild with `uv sync` / `pnpm install` when work resumes there.
 
 ## Disk pressure
-- `tidy.py --pressure` (hourly cron): when the first root's disk is at or above `pressure_percent` (default 80), it
+- `tidy.py --pressure` (meant for an hourly cron job): when the first root's disk is at or above `pressure_percent` (default 80), it
   runs `--auto`, then `uv cache prune`, `pnpm store prune`, `npm cache verify` and `podman image prune -f` (dangling
   only; missing tools skipped), and logs `<mount> 92% -> 78%`. Still at 90% or more: a line in
   `~/.claude/tidy-alert.txt`. Below the threshold it does nothing.
-- `tidy.py disk`: one line for the standup, e.g. `/data 71% (142/200 GB); ask backlog: 12 worktrees, 9.1 GB`. A
+- `tidy.py disk`: one status line (the `standup` skill uses it when installed), e.g. `/data 71% (142/200 GB); ask backlog: 12 worktrees, 9.1 GB`. A
   growing Ask backlog means step 3 is due.
 
 ## 3. Walk through Ask
@@ -61,4 +61,4 @@ didn't pick; `--auto` never touches them.
 ## Notes
 - Config: `~/.claude/tidy.json` `{"roots": [...], "keep": [...], "min_age_hours": 24, "pressure_percent": 80}`; created with defaults on first run.
 - Log of every `--apply`/`--auto`/acting `--pressure` run: `~/.claude/tidy.log`. One run at a time (`~/.claude/tidy.lock`).
-- Tests: `cd ~/.claude/skills/tidy && /usr/bin/python3.11 -B -m unittest -v test_tidy`.
+- Tests: `cd ~/.claude/skills/tidy && python3 -B -m unittest -v test_tidy`.

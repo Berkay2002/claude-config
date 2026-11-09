@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-"""Classification and removal rules of tidy.py, on throwaway repos. Run: /usr/bin/python3.11 -B -m unittest -v test_tidy
+"""Classification and removal rules of tidy.py, on throwaway repos. Run: python3 -B -m unittest -v test_tidy
 
 Every test runs with HOME, git config and the claude CLI pointed into a temp dir (a fake `claude`), so nothing
 here can reach the real machine's repos, sessions or `claude rm`.

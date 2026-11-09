@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Links this repo into ~/.claude and merges settings.shared.json into settings.json. Safe to re-run. Needs jq.
 # Usage (repo must be cloned to ~/.claude/shared):  ./install.sh [--with-mods] [--with-agent-mail]
+#   A plain install links the agents and the core skills (orchestrate, tech-debt, tidy) and merges the settings.
 #   --with-mods        also installs the berkays-mods plugins (settings.mods.json)
-#   --with-agent-mail  also adds the agent-mail hooks and the routing gate (settings.agent-mail.json)
+#   --with-agent-mail  also adds the agent-mail hooks and the routing gate (settings.agent-mail.json), the needs and
+#                      standup skills, and links codex/AGENTS.md into $CODEX_HOME (default ~/.codex) when it exists
 # The choice is kept in local/install-extras (one word per line: mods, agent-mail), so a plain re-run keeps it;
 # delete a line there to turn that extra off again.
 # Exits 1 when a plugin could not be installed; the applied-settings marker is then not written.
@@ -37,9 +39,10 @@ want="$(git -C "$shared" hash-object --path=settings.shared.json "$snap")"
 # Opt-in extras: recorded ones plus the flags; the marker stays the hash of settings.shared.json alone (config-sync compares that).
 if [ -n "$want_x" ]; then mkdir -p "$shared/local"; { [ -f "$extras" ] && cat "$extras"; printf '%s' "$want_x"; } | sort -u > "$extras.tmp" && mv "$extras.tmp" "$extras"; fi
 eff="$(mktemp "$claude/settings.effective.XXXXXX")"; cp "$snap" "$eff"
+on() { [ -f "$extras" ] && grep -qxF "$1" "$extras"; }
 for x in mods agent-mail; do
   # shortcut: jq * replaces arrays, so no two of these files may set the same hook event; merge arrays if that changes.
-  if [ -f "$extras" ] && grep -qxF "$x" "$extras"; then
+  if on "$x"; then
     jq -s '.[0] * .[1]' "$eff" "$shared/settings.$x.json" > "$eff.tmp" || { echo "settings.$x.json is not valid JSON." >&2; exit 1; }
     mv "$eff.tmp" "$eff"; echo "With $x."
   fi
@@ -60,10 +63,15 @@ fi
 # 2. Symlinks for agents and repo-owned skills.
 link() { [ -L "$2" ] && return; [ -e "$2" ] && mv "$2" "$backups/$(basename "$2").$stamp"; ln -s "$1" "$2"; }
 link "$shared/agents" "$claude/agents"
-for d in "$shared"/skills/*/; do d="${d%/}"; link "$d" "$claude/skills/$(basename "$d")"; done
-# Codex reads its global rules from $CODEX_HOME/AGENTS.md; linked only where Codex is set up.
+for n in orchestrate tech-debt tidy; do link "$shared/skills/$n" "$claude/skills/$n"; done
+# needs and standup work through agent-mail (council, role sessions): only with that extra. Without it, drop our own old links.
+for n in needs standup; do
+  if on agent-mail; then link "$shared/skills/$n" "$claude/skills/$n"
+  elif [ -L "$claude/skills/$n" ] && [ "$(readlink "$claude/skills/$n")" = "$shared/skills/$n" ]; then rm "$claude/skills/$n"; fi
+done
+# Codex reads its global rules from $CODEX_HOME/AGENTS.md; Codex workers run through agent-mail, so only with that extra and where Codex is set up.
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-if [ -d "$codex_home" ]; then
+if on agent-mail && [ -d "$codex_home" ]; then
   link "$shared/codex/AGENTS.md" "$codex_home/AGENTS.md" || echo "warning: Codex rules not linked to $codex_home/AGENTS.md" >&2
   # This machine's Codex notes (gitignored local/AGENTS.md), read by the shared rules when present.
   if [ -f "$shared/local/AGENTS.md" ]; then

@@ -62,7 +62,7 @@ If it misbehaves, fall back to `git worktree add ../<repo>-worktrees/<name> -b f
 trust the folder in `~/.claude.json` `projects.<path>.hasTrustDialogAccepted`, and launch there.)
 Run each launch line inside a tmux window (`tmux new-window -d -n <repo>-<name> -c <repo> "<launch line>"`) so it
 survives the laptop closing. tmux too old for `-e`? Pass variables with `env VAR=… <launch line>`.
-Codex workers instead: [codex-workers.md](codex-workers.md) (start, message and retire them through agent-mail).
+Codex workers instead, when agent-mail is installed: [codex-workers.md](codex-workers.md) (start, message and retire them through it).
 Check with `claude agents --json`. Then subscribe once per worker:
 `SendMessage({to: "<repo>-<name>", message: "", notify_when_idle: true})`. Never poll.
 
@@ -102,4 +102,4 @@ Every merge or commit you report names the repo by its full path, the branch it 
 not pushed), commit abc1234". A bare "merged (abc1234)" is ambiguous across repos.
 One report at the end (or at a blocker), not a relay of each worker message. Anything the user must decide or
 approve: ask with AskUserQuestion (one plain sentence of context, the recommended option first), once.
-As a role session, follow the role rules too (council post of at most 3 lines, relayed go).
+As a role session (agent-mail setup, when installed), follow the role rules too (council post of at most 3 lines, relayed go).

@@ -1,7 +1,9 @@
 # Links this repo into ~/.claude and merges settings.shared.json into settings.json. Safe to re-run.
 # Usage (repo must be cloned to ~/.claude/shared):  ./install.ps1 [-WithMods] [-WithAgentMail]
+#   A plain install links the agents and the core skills (orchestrate, tech-debt, tidy) and merges the settings.
 #   -WithMods        also installs the berkays-mods plugins (settings.mods.json)
-#   -WithAgentMail   also adds the agent-mail hooks and the routing gate (settings.agent-mail.json)
+#   -WithAgentMail   also adds the agent-mail hooks and the routing gate (settings.agent-mail.json), the needs and
+#                    standup skills, and copies codex\AGENTS.md into $env:CODEX_HOME (default ~\.codex) when it exists
 # The choice is kept in local\install-extras (one word per line: mods, agent-mail), so a plain re-run keeps it;
 # delete a line there to turn that extra off again.
 # Works in Windows PowerShell 5.1 and PowerShell 7. Exits 1 when a plugin could not be installed; the applied-settings marker is then not written.
@@ -70,14 +72,25 @@ function Link($target, $link) {
   New-Item -ItemType Junction -Path $link -Target $target | Out-Null
 }
 Link (Join-Path $shared 'agents') (Join-Path $claude 'agents')
-Get-ChildItem (Join-Path $shared 'skills') -Directory | ForEach-Object { Link $_.FullName (Join-Path $claude "skills\$($_.Name)") }
+foreach ($n in 'orchestrate', 'tech-debt', 'tidy') { Link (Join-Path $shared "skills\$n") (Join-Path $claude "skills\$n") }
+# needs and standup work through agent-mail (council, role sessions): only with that extra. Without it, drop our own old junctions.
+foreach ($n in 'needs', 'standup') {
+  $from = Join-Path $shared "skills\$n"; $to = Join-Path $claude "skills\$n"
+  if ($have -contains 'agent-mail') { Link $from $to; continue }
+  $item = Get-Item $to -ErrorAction SilentlyContinue
+  $target = if ($item -and $item.LinkType) { @($item.Target)[0] }
+  if ($target -and [IO.Path]::GetFullPath($target).TrimEnd('\') -eq [IO.Path]::GetFullPath($from).TrimEnd('\')) {
+    [IO.Directory]::Delete($to)  # removes the junction only; Remove-Item can recurse into the target on 5.1
+  }
+}
 # Codex reads its global rules from $CODEX_HOME\AGENTS.md. A file symlink needs admin or Developer Mode, so this is a copy,
-# refreshed on each run; a symlink you made yourself is left alone. Only where Codex is set up; a failure only warns.
+# refreshed on each run; a symlink you made yourself is left alone. Codex workers run through agent-mail, so only with
+# that extra and where Codex is set up; a failure only warns.
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 # The shared rules, and this machine's notes from the gitignored local\AGENTS.md when it exists.
 $codexCopies = @(@((Join-Path $shared 'codex\AGENTS.md'), (Join-Path $codexHome 'AGENTS.md')),
                  @((Join-Path $shared 'local\AGENTS.md'), (Join-Path $codexHome 'AGENTS.local.md')))
-if (Test-Path $codexHome -PathType Container) {
+if ($have -contains 'agent-mail' -and (Test-Path $codexHome -PathType Container)) {
   foreach ($pair in $codexCopies) {
     $from, $to = $pair
     if (-not (Test-Path $from -PathType Leaf)) { continue }
