@@ -14,7 +14,10 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import timedelta
+import contextlib
+import io
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1316,6 +1319,7 @@ class DecideHookTests(Base):
         d = self.state()["Push it?"]
         self.assertEqual((d["status"], d["answer"], d["answered_in"], d["by"]),
                          ("answered", "Wait\nafter 5", "pm window", "pm"))
+        self.assertEqual(self.lines()[-1]["via"], "hook")  # routing_gate.py trusts only dialog answers
         self.assertEqual(len(self.lines()), 2)
 
     def test_multiple_questions_and_multiselect(self):
@@ -1395,6 +1399,123 @@ class DecideHookTests(Base):
             am.fcntl.flock(lk, am.fcntl.LOCK_EX)
             self.hook("pre", self.pre([self.Q1]))
         self.assertFalse(os.path.exists(self.store()))
+
+
+class QuietHoursTests(Base):
+    """Outside work hours: AskUserQuestion is denied and queued as a decision, PushNotification is denied."""
+
+    Q1, Q2, store, pre, post, state, lines = (getattr(DecideHookTests, k) for k in
+                                              ("Q1", "Q2", "store", "pre", "post", "state", "lines"))
+
+    HOURS = {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "07:00", "end": "18:00", "zone": "Europe/Stockholm"}
+    STO = ZoneInfo("Europe/Stockholm")
+    IN = datetime(2026, 11, 9, 10, 0, tzinfo=STO)  # a Monday
+    OUT = datetime(2026, 11, 9, 20, 0, tzinfo=STO)
+
+    def setUp(self):
+        super().setUp()
+        self.file = os.path.join(self.tmp, ".claude", "work-hours.json")
+        self.write(self.HOURS)
+
+    def write(self, h):
+        os.makedirs(os.path.dirname(self.file), exist_ok=True)
+        with open(self.file, "w") as f:
+            f.write(h if isinstance(h, str) else json.dumps(h))
+
+    def run_hook(self, phase, payload=None, now=None):
+        """In process, so the clock can be set; the file comes from $HOME (the test's tmp dir). Returns the deny
+        reason, or None when the hook allowed (printed nothing)."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(am.decide_hook(phase, io.StringIO(json.dumps(payload or {})), now=now or self.OUT), 0)
+        if not buf.getvalue():
+            return None
+        h = json.loads(buf.getvalue())["hookSpecificOutput"]
+        self.assertEqual((h["hookEventName"], h["permissionDecision"]), ("PreToolUse", "deny"))
+        return h["permissionDecisionReason"]
+
+    def log(self):
+        try:
+            with open(os.path.join(self.mail, "decide-hook.log")) as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def test_boundaries_weekend_and_dst(self):
+        q = lambda *a, tz=self.STO: am.quiet_hours(datetime(*a, tzinfo=tz), self.file)  # noqa: E731
+        self.assertEqual([q(2026, 11, 9, h, m) is None for h, m in ((6, 59), (7, 0), (17, 59), (18, 0))],
+                         [False, True, True, False])
+        self.assertIsNone(q(2026, 11, 9, 17, 59, 59))
+        self.assertEqual(q(2026, 11, 14, 10, 0), "outside Mon–Fri 07:00–18:00 Europe/Stockholm")  # Saturday
+        # 05:30 UTC is 06:30 the Monday before the clocks go forward (29 March) and 07:30 the Monday after
+        self.assertIsNotNone(q(2026, 3, 23, 5, 30, tz=timezone.utc))
+        self.assertIsNone(q(2026, 3, 30, 5, 30, tz=timezone.utc))
+        self.write(self.HOURS | {"days": ["mon", "wed"]})
+        self.assertEqual(q(2026, 11, 14, 10, 0), "outside Mon, Wed 07:00–18:00 Europe/Stockholm")
+
+    def test_missing_invalid_or_bad_zone_file_allows(self):
+        os.remove(self.file)
+        self.assertIsNone(am.quiet_hours(self.OUT, self.file))
+        self.assertIsNone(self.run_hook("push"))
+        bad = ["not json", [], self.HOURS | {"zone": "Mars/Base"}, self.HOURS | {"days": ["monday"]},
+               self.HOURS | {"start": "18:00", "end": "07:00"}, self.HOURS | {"start": 7}, {"days": ["mon"]}]
+        for h in bad:
+            self.write(h)
+            self.assertIsNone(self.run_hook("push"), h)
+        self.assertIsNone(self.run_hook("pre", self.pre([self.Q1])))
+        self.assertEqual(self.state()["Push it?"]["asked_in"], "window")
+        self.assertEqual(self.log().count("bad work-hours file"), len(bad) + 1)
+
+    def test_queued_once_then_touched_and_no_answer_recorded(self):
+        r = self.run_hook("pre", self.pre([self.Q1, self.Q2]))
+        st = self.state()
+        ids = [st["Push it?"]["id"], st["Which files?"]["id"]]
+        self.assertEqual(r, f"Quiet hours (outside Mon–Fri 07:00–18:00 Europe/Stockholm): recorded as {', '.join(ids)} "
+                            "for the user. Don't ask again; carry on with work that needs no answer, or stop.")
+        self.assertEqual({d["asked_in"] for d in st.values()}, {"queued"})
+        self.assertIn(ids[0], self.run_hook("pre", self.pre([self.Q1], "toolu_2")))
+        self.assertEqual([e["event"] for e in self.lines()], ["open", "open", "touch"])
+        p = self.post([self.Q1], {}, "toolu_2")
+        p["tool_response"] = None  # a denied dialog never runs: no answers, so nothing is recorded
+        self.run_hook("post", p)
+        self.assertEqual(self.state()["Push it?"]["status"], "open")
+        self.assertEqual(self.log(), "")
+
+    def test_queued_at_night_answered_by_day(self):
+        self.assertIsNotNone(self.run_hook("pre", self.pre([self.Q1], "toolu_1")))
+        self.assertIsNone(self.run_hook("pre", self.pre([self.Q1], "toolu_2"), now=self.IN))
+        self.run_hook("post", self.post([self.Q1], {"Push it?": "Go"}, "toolu_2"), now=self.IN)
+        d = self.state()["Push it?"]
+        self.assertEqual((d["status"], d["answer"], d["asked_in"]), ("answered", "Go", "window"))
+
+    def test_inside_hours_unchanged(self):
+        self.assertIsNone(self.run_hook("pre", self.pre([self.Q1]), now=self.IN))
+        self.assertEqual(self.state()["Push it?"]["asked_in"], "window")
+        self.assertIsNone(self.run_hook("push", now=self.IN))
+
+    def test_push_denied_outside_allowed_inside(self):
+        self.assertEqual(self.run_hook("push"), "Quiet hours: no push. Post to the council instead if it matters.")
+        self.assertIsNone(self.run_hook("push", now=self.IN))
+        self.assertFalse(os.path.exists(self.store()))
+        r = subprocess.run([sys.executable, AM, "decide-hook", "push"], env=dict(os.environ), capture_output=True,
+                           text=True, input="{}", timeout=20)  # the CLI phase exists; the real clock decides
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_errors_allow(self):
+        os.makedirs(self.store())  # a directory where the store should be
+        self.assertIsNone(self.run_hook("pre", self.pre([self.Q1])))
+        self.assertIn("Error", self.log())
+        os.makedirs(self.mail + "x")
+        self.assertIsNone(self.run_hook("pre", None))  # no questions: nothing recorded, so nothing to deny
+        os.remove(self.file)
+        os.makedirs(self.file)  # unreadable
+        self.assertIsNone(self.run_hook("push"))
+
+    def test_unnamed_session_not_recorded_but_push_denied(self):
+        del os.environ["AGENT_MAIL_NAME"]
+        self.assertIsNone(self.run_hook("pre", self.pre([self.Q1])))
+        self.assertFalse(os.path.exists(self.mail))
+        self.assertIsNotNone(self.run_hook("push"))
 
 
 if __name__ == "__main__":

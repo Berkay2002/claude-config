@@ -18,7 +18,8 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
+from zoneinfo import ZoneInfo
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # no dots: `x.rec` would collide with x's lock files
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
@@ -327,7 +328,7 @@ def my_channels():
 CLOSERS = {"answer": "answered", "withdraw": "withdrawn", "expire": "expired", "supersede": "superseded"}
 OWNER_ONLY = ("withdraw", "expire", "supersede", "touch")  # `answer`: any named session that heard it
 STATUSES = ("open", *CLOSERS.values())
-ASKED_IN_RE = re.compile(r"^(window|today|council#[0-9]+)$")
+ASKED_IN_RE = re.compile(r"^(window|today|queued|council#[0-9]+)$")
 STALE_HOURS = 72
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
@@ -400,7 +401,7 @@ def decide_open(by, question, options=None, recommended=None, valid_until=None, 
         raise MailError("options must be a list of strings")
     asked_in = asked_in or "window"
     if not isinstance(asked_in, str) or not ASKED_IN_RE.match(asked_in):
-        raise MailError(f"asked_in must be window, today or council#<id>, got {asked_in!r}")
+        raise MailError(f"asked_in must be window, today, queued or council#<id>, got {asked_in!r}")
     fields = {"role": by, "question": question, "options": options or None,
               "recommended": opt_str(recommended, "recommended"), "asked_in": asked_in,
               "valid_until": opt_str(valid_until, "valid_until"), **extra}
@@ -1177,10 +1178,37 @@ def hook_root():
     return root()
 
 
-def ask_hook(phase, ev):
-    """PreToolUse: one `open` per question (asked_in window), or a `touch` when this role has it open already.
-    PostToolUse: an `answer` per answered question; no answers (dismissed, failed) leaves it open."""
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+QUIET_PUSH = "Quiet hours: no push. Post to the council instead if it matters."
+
+
+def quiet_hours(now=None, path=None):
+    """None inside the user's working hours (or with no ~/.claude/work-hours.json), else a phrase such as
+    'outside Mon–Fri 07:00–18:00 Europe/Stockholm'. Raises on an unreadable or invalid file (the hook: inside)."""
+    path = path or os.path.join(os.path.expanduser("~"), ".claude", "work-hours.json")
+    try:
+        with open(path) as f:
+            h = json.load(f)
+    except FileNotFoundError:
+        return None
+    days, start, end, zone = h["days"], dtime.fromisoformat(h["start"]), dtime.fromisoformat(h["end"]), h["zone"]
+    if not isinstance(days, list) or not days or any(d not in WEEKDAYS for d in days) or not start < end:
+        raise ValueError(f"work hours: need days from {WEEKDAYS} and start before end, got {h!r}")
+    t = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(zone))
+    if WEEKDAYS[t.weekday()] in days and start <= t.time() < end:
+        return None
+    ix = sorted(WEEKDAYS.index(d) for d in set(days))
+    span = (f"{WEEKDAYS[ix[0]]}–{WEEKDAYS[ix[-1]]}" if len(ix) > 2 and ix == list(range(ix[0], ix[-1] + 1))
+            else ", ".join(WEEKDAYS[i] for i in ix)).title()
+    return f"outside {span} {h['start']}–{h['end']} {zone}"
+
+
+def ask_hook(phase, ev, queued=False):
+    """PreToolUse: one `open` per question (asked_in window, or queued in quiet hours), or a `touch` when this role
+    has it open already; returns the ids. PostToolUse: an `answer` per answered question; no answers (dismissed,
+    failed) leaves it open."""
     role = me()
+    ids = []
     qs = [q for q in ((ev.get("tool_input") or {}).get("questions") or []) if isinstance(q, dict) and q.get("question")]
     tid = ev.get("tool_use_id")
     answers, notes, lost = {}, {}, []
@@ -1202,15 +1230,18 @@ def ask_hook(phase, ev):
                 and d["status"] == "open"]
         if phase == "pre":
             if tid and mine and mine[-1].get("tool_use_id") == tid:
+                ids.append(mine[-1]["id"])
                 continue  # the same call seen twice
             opts = q.get("options")
             opts = opts if isinstance(opts, list) else []
             labels = [o["label"] for o in opts if isinstance(o, dict) and isinstance(o.get("label"), str) and o["label"]]
             if mine:
-                decide_close(role, mine[-1]["id"], "touch", tool_use_id=tid)
+                decide_close(role, mine[-1]["id"], "touch", tool_use_id=tid, asked_in="queued" if queued else "window")
+                ids.append(mine[-1]["id"])
             else:
-                decide_open(role, text, labels or None, next((x for x in labels if "(Recommended)" in x), None),
-                            asked_in="window", tool_use_id=tid)
+                rec = next((x for x in labels if "(Recommended)" in x), None)
+                ids.append(decide_open(role, text, labels or None, rec, asked_in="queued" if queued else "window",
+                                       tool_use_id=tid))
             continue
         a = answers.get(text)
         a = ", ".join(map(str, a)) if isinstance(a, list) else a
@@ -1221,14 +1252,32 @@ def ask_hook(phase, ev):
             continue
         n = notes.get(text)
         note = n.get("notes") if isinstance(n, dict) and isinstance(n.get("notes"), str) else None
-        decide_close(role, mine[-1]["id"], "answer", "\n".join(x for x in (str(a), note) if x), _hook=True)
+        decide_close(role, mine[-1]["id"], "answer", "\n".join(x for x in (str(a), note) if x), _hook=True,
+                     via="hook")  # marks the user's own dialog answer (routing_gate.py trusts only these)
     if lost:
         raise MailError(f"answered but no open decision of {role} for: {lost}")
+    return ids
 
 
-def decide_hook(phase, stdin=None):
-    """Claude Code hook for AskUserQuestion. Never blocks or slows the tool: always exit 0, nothing on stdout (a
-    PreToolUse hook's stdout can be read as a decision), a 1.5 s budget, every error logged to decide-hook.log."""
+def hook_log(phase, text):
+    """Appends to decide-hook.log; a missing mail dir or a failed write is swallowed (the budget alarm is not)."""
+    try:
+        hook_root()
+        os.makedirs(root(), mode=0o700, exist_ok=True)
+        with open(os.open(os.path.join(root(), "decide-hook.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+                  "a") as f:
+            f.write(f"{now_iso()} decide-hook {phase}: {text}")
+    except HookTimeout:
+        raise
+    except Exception:
+        pass
+
+
+def decide_hook(phase, stdin=None, now=None, hours=None):
+    """Claude Code hook: `pre|post` for AskUserQuestion, `push` for PushNotification. Never blocks or slows the tool:
+    always exit 0, a 1.5 s budget, every error logged to decide-hook.log. Stdout stays empty (allow) except for one
+    PreToolUse deny in quiet hours (quiet_hours): `pre` records the questions as queued, `push` drops the push.
+    `now` and `hours` (the hours file) are for tests."""
     out, sys.stdout = sys.stdout, open(os.devnull, "w")
 
     def alarm(*_):
@@ -1236,25 +1285,40 @@ def decide_hook(phase, stdin=None):
     try:
         signal.signal(signal.SIGALRM, alarm)
         signal.setitimer(signal.ITIMER_REAL, HOOK_BUDGET)
-        if not os.environ.get("AGENT_MAIL_NAME"):
+        if phase != "push" and not os.environ.get("AGENT_MAIL_NAME"):
             return 0  # not a named session: nothing to record
         try:
-            if phase not in ("pre", "post"):
-                raise MailError(f"decide-hook: phase must be pre or post, got {phase!r}")
-            hook_root()
-            ask_hook(phase, json.load(stdin or sys.stdin))
+            if phase not in ("pre", "post", "push"):
+                raise MailError(f"decide-hook: phase must be pre, post or push, got {phase!r}")
+            raw = (stdin or sys.stdin).read()
+            quiet = None
+            if phase != "post":
+                try:
+                    quiet = quiet_hours(now, hours)
+                except HookTimeout:
+                    raise
+                except Exception:
+                    hook_log(phase, f"bad work-hours file, treated as inside hours: {traceback.format_exc()}")
+            if phase == "push":
+                reason = quiet and QUIET_PUSH
+            else:
+                hook_root()
+                ids = ask_hook(phase, json.loads(raw), queued=bool(quiet))
+                reason = quiet and ids and (f"Quiet hours ({quiet}): recorded as {', '.join(ids)} for the user. "
+                                            "Don't ask again; carry on with work that needs no answer, or stop.")
+            if reason:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                         "permissionDecisionReason": reason}}), file=out)
         except BaseException:
-            msg = f"{now_iso()} decide-hook {phase}: {traceback.format_exc()}"
             signal.setitimer(signal.ITIMER_REAL, 0)
-            os.makedirs(root(), mode=0o700, exist_ok=True)
-            with open(os.open(os.path.join(root(), "decide-hook.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
-                      "a") as f:
-                f.write(msg)
+            hook_log(phase, traceback.format_exc())
     except BaseException:
         pass  # no mail dir to log to, or the log itself failed: still never in Claude's way
     finally:
         signal.signal(signal.SIGALRM, signal.SIG_IGN)  # a late alarm must not escape as exit 1
         signal.setitimer(signal.ITIMER_REAL, 0)
+        sys.stdout.close()
         sys.stdout = out
     return 0
 
@@ -1300,7 +1364,7 @@ def main(argv):
         run_worker(argv[2])
     else:
         print("usage: agent_mail.py [serve | run <worker> | council post|read|tail | send [--from NAME] <to> <text> | "
-              "decide [--by NAME] open|close|list | decide-hook pre|post]", file=sys.stderr)
+              "decide [--by NAME] open|close|list | decide-hook pre|post|push]", file=sys.stderr)
         return 2
     return 0
 

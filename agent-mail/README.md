@@ -154,7 +154,7 @@ A line that does not parse (cut short by a crash) is skipped; the next post star
 
 One store, `$AGENT_MAIL_DIR/decisions.jsonl` (mode 600), append-only under `decisions.lock`: one event per line,
 `ts`, `id`, `event` (`open | answer | withdraw | expire | supersede | touch`), `role` (owner), `question`, `options`,
-`recommended`, `asked_in` (`window | today | council#<id>`), `valid_until` (ISO date or free text), `answer` (his words
+`recommended`, `asked_in` (`window | today | queued | council#<id>`; `queued`: the hook held it back in quiet hours), `valid_until` (ISO date or free text), `answer` (his words
 verbatim), `answered_in` (`page | council#<id> | <role> window`), `superseded_by`, `by` (who wrote it). The hook adds
 `tool_use_id`. Ids are assigned by agent-mail under the lock. A decision's state is its events folded in order (the
 last closing event gives its status); a torn last line is skipped. **Stale** is computed, never stored: open for
@@ -183,6 +183,12 @@ labels joined with `, `, plus `annotations[q].notes` if present), `answered_in` 
 `tool_response` (dismissed, failed) leaves it open. It always exits 0 with nothing on stdout, gives up after 1.5 s,
 and logs errors to `$AGENT_MAIL_DIR/decide-hook.log`. Hooks get Claude Code's env, not the MCP server's, so without
 `AGENT_MAIL_DIR` it reads the dir from the `agent-mail` entry in `~/.claude.json`.
+
+**Quiet hours**: `~/.claude/work-hours.json` (`{"days":["mon",...,"fri"],"start":"07:00","end":"18:00",
+"zone":"Europe/Stockholm"}`, start inclusive, end exclusive) sets the user's working hours. Outside them, in a named
+session, `decide-hook pre` records each question with `asked_in` queued (or touches the open one) and denies the
+dialog with a reason naming the ids; `decide-hook push` (PreToolUse matcher `PushNotification`, every session) denies
+the push. Inside the hours, with no file, a bad file (logged) or on any error, both allow as before.
 
 ## Permissions: workers run unsandboxed by default
 
