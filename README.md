@@ -3,8 +3,9 @@
 
 A cost-first Claude Code setup: one Opus session plans and reviews, and hands the work to cheaper workers, each at an
 explicit effort level: Haiku to read, Opus at medium effort to build (Sonnet as the cheaper rung), and a reviewer one
-model up only where mistakes are expensive. Install it once per device; every device then gets the same rules, agents,
-skills and settings.
+model up only where mistakes are expensive: critical reviews (the final review before merge, security, data-loss and
+concurrency paths, debugging after one failed fix) go to Fable 5.2 at high effort. Install it once per device; every
+device then gets the same rules, agents, skills and settings.
 
 A real session, sped up between the routing lines (sound on):
 
@@ -14,7 +15,7 @@ https://github.com/user-attachments/assets/bc9a5004-35cc-4b0a-93a1-8ff33cff70fb
 | Path | What |
 |---|---|
 | `CLAUDE.md` | The rules: which model and effort for which job, how to split work, when to escalate, the weekly budget pace. Imported from your `~/.claude/CLAUDE.md` |
-| `agents/` | `scout` (Haiku@medium: read, search, summarise), `scout-lead` (Sonnet@medium: splits a big read across scouts), `builder` (Opus@medium: code with a test), `reviewer` (Opus@medium: judgement) |
+| `agents/` | `scout` (Haiku@medium: read, search, summarise), `scout-lead` (Sonnet@medium: splits a big read across scouts), `builder` (Opus@medium: code with a test), `reviewer` (Opus@medium: judgement; `model: fable` at high for the critical reviews) |
 | `skills/orchestrate` | Run a feature as parallel background sessions in git worktrees, coordinated from one session |
 | `skills/tech-debt` | Gather debt (ponytail-debt, ponytail-audit, greps, open issues), score it with one `reviewer`, keep a ledger per repo |
 | `skills/tidy` | Clean up worktrees, finished background sessions and offline Remote Control rows without losing work (`--auto` does the safe part, e.g. from a daily cron job) |
@@ -120,7 +121,13 @@ The five candidates worth using (AA detail page, same date):
 | Knowledge without hallucinating (Omniscience) | **6** | 21 | 40 | 41 | 24 |
 
 Prices per MTok (input / output / cache read): Haiku 0.10 / 0.50 / 0.01 below 100K prompt, 5× that above ·
-Sonnet 2 / 10 / 0.10 · Opus 4 / 20 / 0.20. The AA numbers already use Sonnet's $0.10 cache reads.
+Sonnet 2 / 10 / 0.10 · Opus 4 / 20 / 0.20 · Fable 5.2 8 / 40 (input / output). The AA numbers already use Sonnet's
+$0.10 cache reads.
+
+Fable 5.2 is not in the Artificial Analysis tables above; there are no benchmark numbers for it here. `CLAUDE.md` relies
+only on this: it costs 2× Opus per token but is reported level with Opus 5.5 at about half the cost per task. The
+advisor sits one rung above the worker: Haiku or Sonnet → Opus, Opus → Fable 5.2, Fable → none. Opus at xhigh/max for
+workers, and Fable outside the critical reviews and the advisor, need the user's OK.
 
 Anthropic, "Optimizing for cost and intelligence" and the advisor docs (Oct 2026):
 - Opus 5.5 on long-horizon coding, vs `high`: `medium` ≈ −2.5 points at ~70% of the cost; `xhigh` ≈ +1.4 at 2.5×.
@@ -131,7 +138,7 @@ Anthropic, "Optimizing for cost and intelligence" and the advisor docs (Oct 2026
   Sonnet at default effort for less (coding). Subscription: counts toward plan limits. Needs feature-flag fetching
   (`DISABLE_TELEMETRY` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` turn it off silently).
 - Prompt cache (code.claude.com/docs/en/prompt-caching): switching model invalidates it, and so does each plan-mode
-  toggle under `opusplan`. Changing effort keeps it on Opus/Sonnet/Haiku 5.5 and Fable 5.1 with a subscription or API
+  toggle under `opusplan`. Changing effort keeps it on Opus/Sonnet/Haiku 5.5 and Fable with a subscription or API
   key (not on Bedrock, Agent Platform, apps gateway, `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, HIPAA). Toggling the
   advisor keeps it. Subagents get a 5-minute cache TTL even on a subscription (`subagentPromptCacheTtl` changes it).
 
